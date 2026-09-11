@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>FileHub - 文件服务</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📁</text></svg>">
+<script>
+/* 首帧前确定主题：本地记忆优先，否则跟随系统。必须在 CSS 渲染前执行，避免暗色闪白 */
+(function () {
+  try {
+    var t = localStorage.getItem('fh-theme');
+    if (t !== 'dark' && t !== 'light') {
+      t = (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = 'light'; }
+})();
+</script>
+</head>
+<body class="preload">
+
+<!-- ====== 初次设置 ====== -->
+<section id="setup" class="setup hidden">
+  <div class="setup-card">
+    <div class="setup-icon">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+      </svg>
+    </div>
+    <h1>选择文件目录</h1>
+    <p class="sub">首次使用，请指定一个本地磁盘目录作为文件服务的根目录。</p>
+    <div class="field">
+      <input id="setup-path" type="text" placeholder="例如 D:\share 或 /home/user/share" autocomplete="off">
+      <button id="setup-browse" class="btn btn-soft">浏览</button>
+    </div>
+    <div class="quick-row">
+      <span class="quick-label">常用：</span>
+      <button class="chip" data-quick="__desktop__">桌面</button>
+      <button class="chip" data-quick="__downloads__">下载</button>
+      <button class="chip" data-quick="__docs__">文档</button>
+      <button class="chip" data-quick="__cwd__">当前程序目录</button>
+    </div>
+    <div id="setup-browser" class="hidden">
+      <div id="dir-crumb-setup" class="crumb crumb-modal"></div>
+      <div id="dir-list-setup" class="dir-list"></div>
+      <button id="setup-dir-ok" class="btn btn-soft btn-block">使用当前浏览的目录</button>
+    </div>
+    <button id="setup-confirm" class="btn btn-primary btn-block">使用该目录</button>
+    <p class="hint">目录必须真实存在，之后可在左侧「修改目录」随时更换。</p>
+  </div>
+</section>
+
+<!-- ====== 主界面 ====== -->
+<div id="main" class="app hidden">
+
+  <!-- 侧边栏 -->
+  <aside class="sidebar">
+    <div class="logo">
+      <span class="logo-ic">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+      </span>
+      FileHub
+    </div>
+
+    <nav class="nav">
+      <div class="nav-group">文件管理</div>
+      <button class="nav-item active" id="nav-files" data-view="files">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+        所有文件
+      </button>
+      <button class="nav-item" id="nav-trash" data-view="trash">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+        回收站
+      </button>
+
+      <div class="nav-group">分享</div>
+      <button class="nav-item" id="nav-share-mgr" data-view="shares">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v7a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-7"/><path d="M12 3v13"/><path d="m7.5 7.5 4.5-4.5 4.5 4.5"/></svg>
+        分享管理
+      </button>
+
+      <div class="nav-group">设置</div>
+      <button class="nav-item" id="nav-chdir" data-view="chdir">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
+        修改目录
+      </button>
+      <button class="nav-item" id="nav-tidy" data-view="tidy">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+        定时清理
+      </button>
+      <button class="nav-item" id="nav-security" data-view="security">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-3.6 8-10V5l-8-3-8 3v7c0 6.4 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+        安全与会话
+      </button>
+      <button class="nav-item" id="nav-update" data-view="update">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+        检查更新
+      </button>
+    </nav>
+
+    <div class="sidebar-foot">
+      <button class="nav-item" id="btn-theme" title="切换深色/浅色主题">
+        <svg id="ic-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+        <svg id="ic-sun" class="hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        <span id="theme-label">深色模式</span>
+      </button>
+      <button class="nav-item logout-item" id="btn-logout">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></svg>
+        退出登录
+      </button>
+    </div>
+  </aside>
+
+  <!-- 右侧主区 -->
+  <div class="content">
+    <header class="topbar" id="topbar">
+      <div class="search-wrap">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+        <input id="search-input" type="search" placeholder="搜索文件、文件夹（全盘递归）" autocomplete="off">
+      </div>
+      <div class="disk-pill" id="disk-pill" title="磁盘空间">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
+        <span class="pill-label">磁盘</span>
+        <span id="disk-pill-pct">—</span>
+        <div class="bar slim pill-bar"><div id="disk-pill-bar" class="bar-inner"></div></div>
+        <span id="disk-pill-free" class="pill-free"></span>
+      </div>
+    </header>
+    <div class="crumbbar" id="crumbbar">
+      <nav id="crumb" class="crumb"></nav>
+    </div>
+
+    <main class="page">
+      <div id="view-files" class="view">
+      <div class="page-head">
+        <h1 id="page-title">文件列表</h1>
+      </div>
+
+      <div class="actions-row">
+        <button id="btn-upload" class="btn btn-primary">
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+          上传文件
+        </button>
+        <button id="btn-mkdir" class="btn btn-soft">
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 11v5"/><path d="M9.5 13.5h5"/></svg>
+          新建文件夹
+        </button>
+        <button id="btn-upload-dir" class="btn btn-soft" title="上传整个文件夹（含子目录）">
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 11v5"/><path d="M9.5 13.5h5"/></svg>
+          上传文件夹
+        </button>
+        <button id="btn-share-new" class="btn btn-soft" disabled>
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>
+          新建分享链接
+        </button>
+        <input id="file-input" type="file" multiple hidden>
+        <input id="dir-input" type="file" webkitdirectory multiple hidden>
+      </div>
+
+      <div id="batch-bar" class="batch-bar hidden">
+        <span>已选 <b id="batch-count">0</b> 项</span>
+        <button id="batch-share" class="btn btn-primary mini">批量创建分享</button>
+        <button id="batch-zip" class="btn btn-primary mini">打包下载 ZIP</button>
+        <button id="batch-move" class="btn btn-soft mini">批量移动</button>
+        <button id="batch-del" class="btn btn-soft mini btn-danger">批量删除</button>
+        <button id="batch-clear" class="btn btn-soft mini">取消选择</button>
+      </div>
+
+      <div class="card">
+        <div class="table-top">
+          <span id="count-info" class="count-info"></span>
+          <div class="table-top-right">
+            <button id="search-clear" class="btn btn-soft mini hidden">返回目录</button>
+            <select id="sort-select" class="input-sm">
+              <option value="time-desc">排序：修改时间 ↓</option>
+              <option value="time-asc">排序：修改时间 ↑</option>
+              <option value="name-asc">排序：名称 ↑</option>
+              <option value="name-desc">排序：名称 ↓</option>
+              <option value="size-desc">排序：大小 ↓</option>
+              <option value="size-asc">排序：大小 ↑</option>
+            </select>
+            <select id="filter-select" class="input-sm">
+              <option value="all">筛选：全部类型</option>
+              <option value="file">筛选：仅文件</option>
+              <option value="dir">筛选：仅文件夹</option>
+            </select>
+            <select id="size-select" class="input-sm">
+              <option value="all">大小：不限</option>
+              <option value="gt-100mb">大于 100 MB</option>
+              <option value="gt-1gb">大于 1 GB</option>
+              <option value="lt-1mb">小于 1 MB</option>
+            </select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th class="th-check"><input type="checkbox" id="check-all" class="row-check" title="全选"></th>
+                <th>文件名</th><th>类型</th><th>大小</th><th>修改时间</th><th>分享状态</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="list"></tbody>
+          </table>
+        </div>
+        <div id="empty" class="empty hidden">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          <p>这个文件夹是空的，把文件拖进来即可上传</p>
+        </div>
+      </div>
+
+      <div id="upload-progress" class="progress-card hidden">
+        <div class="progress-head"><span id="progress-name">上传中…</span><span id="progress-pct">0%</span></div>
+        <div class="bar"><div id="progress-bar" class="bar-inner"></div></div>
+      </div>
+      </div>
+
+      <!-- ====== 分享管理视图 ====== -->
+      <div id="view-shares" class="view hidden">
+        <div class="page-head">
+          <h1>分享管理</h1>
+        </div>
+        <div class="card">
+          <div class="table-top">
+            <label class="switch"><input type="checkbox" id="share-check-all" class="row-check"><span>全选</span></label>
+            <select id="share-filter" class="input-sm">
+              <option value="all">筛选：全部</option>
+              <option value="alive">有效分享</option>
+              <option value="expired">已过期</option>
+              <option value="pw">带密码分享</option>
+              <option value="direct">直链分享</option>
+            </select>
+            <span id="share-count" class="count-info"></span>
+            <div class="table-top-right">
+              <button id="share-batch-revoke" class="btn btn-soft mini btn-danger" disabled>撤销选中</button>
+            </div>
+          </div>
+          <div id="mgr-list" class="mgr-list view-list"></div>
+        </div>
+      </div>
+
+      <!-- ====== 检查更新视图 ====== -->
+      <div id="view-update" class="view hidden">
+        <div class="page-head">
+          <h1>检查更新</h1>
+        </div>
+        <div class="card upd-card">
+          <div class="upd-grid">
+            <div class="upd-item"><span class="upd-label">当前版本</span><span id="upd-version" class="upd-val">—</span></div>
+            <div class="upd-item"><span class="upd-label">程序架构</span><span id="upd-arch" class="upd-val">—</span></div>
+            <div class="upd-item"><span class="upd-label">构建时间</span><span id="upd-build" class="upd-val">—</span></div>
+            <div class="upd-item"><span class="upd-label">对应更新包</span><span id="upd-asset" class="upd-val">—</span></div>
+          </div>
+          <div class="upd-actions">
+            <button id="upd-check" class="btn btn-primary">检查更新</button>
+            <button id="upd-online" class="btn btn-primary hidden">一键更新</button>
+            <a id="upd-download" class="btn btn-soft hidden" target="_blank" rel="noopener">直链下载</a>
+            <button id="ver-upload-link" class="btn btn-soft">本地上传更新包</button>
+            <input type="file" id="ver-upload" class="hidden" accept="application/octet-stream,.exe">
+          </div>
+          <div id="update-status" class="upd-status">点击「检查更新」查询 GitHub 最新版本</div>
+          <div id="upd-cur-notes" class="upd-changelog hidden"></div>
+          <div id="upd-new-notes" class="upd-changelog hidden"></div>
+        </div>
+        <p class="footer-note">服务器连不上 GitHub 时，可在本地下载对应更新包后用「本地上传更新包」安装，效果相同。</p>
+      </div>
+
+      <!-- ====== 定时清理视图 ====== -->
+      <div id="view-tidy" class="view hidden">
+        <div class="page-head">
+          <h1>定时清理</h1>
+        </div>
+        <div class="card chdir-card">
+          <div class="tidy-cfg">
+            <label class="switch">
+              <input type="checkbox" id="tidy-enabled" checked><span>自动清理已过期的分享记录</span>
+            </label>
+            <div class="tidy-hours-row">
+              <span>过期超过</span>
+              <select id="tidy-hours" class="input-sm">
+                <option value="24">24 小时（1 天）</option>
+                <option value="72">72 小时（3 天）</option>
+                <option value="168">168 小时（7 天）</option>
+                <option value="720">720 小时（30 天）</option>
+              </select>
+              <span>的记录将被清除（只清记录，不动文件）</span>
+            </div>
+            <button id="tidy-save" class="btn btn-primary mini">保存设置</button>
+          </div>
+          <div class="tidy-stats">
+            <div class="upd-item"><span class="upd-label">当前保留时长</span><span class="upd-val"><span id="tidy-grace2">72</span> 小时</span></div>
+            <div class="upd-item"><span class="upd-label">待清理（已过期超时）</span><span class="upd-val" id="tidy-pending">—</span></div>
+          </div>
+          <div class="upd-actions">
+            <button id="tidy-refresh" class="btn btn-soft">刷新统计</button>
+            <button id="tidy-run" class="btn btn-primary">立即清理</button>
+          </div>
+          <div id="tidy-status" class="upd-status"></div>
+        </div>
+      </div>
+
+      <!-- ====== 安全与会话视图 ====== -->
+      <div id="view-security" class="view hidden">
+        <div class="page-head">
+          <h1>安全与会话</h1>
+        </div>
+        <div class="card chdir-card">
+          <h2 class="sec-title">活跃登录会话</h2>
+          <div id="sess-list" class="sess-list"><div class="mgr-empty">加载中…</div></div>
+          <p class="hint">踢出后对应的浏览器需要重新登录才能继续访问。</p>
+        </div>
+        <div class="card chdir-card">
+          <h2 class="sec-title">修改管理员密码</h2>
+          <div class="pw-form">
+            <input type="password" id="pw-old" class="input-sm" placeholder="当前密码" autocomplete="current-password">
+            <input type="password" id="pw-new" class="input-sm" placeholder="新密码（至少 6 位）" autocomplete="new-password">
+            <input type="password" id="pw-new2" class="input-sm" placeholder="确认新密码" autocomplete="new-password">
+            <button id="pw-save" class="btn btn-primary">修改密码</button>
+          </div>
+          <div id="pw-status" class="upd-status"></div>
+        </div>
+      </div>
+
+      <!-- ====== 回收站视图 ====== -->
+      <div id="view-trash" class="view hidden">
+        <div class="page-head">
+          <h1>回收站</h1>
+        </div>
+        <div class="card chdir-card">
+          <div class="tidy-cfg">
+            <div class="tidy-hours-row" style="margin:0">
+              <span>删除的文件会先进入回收站，超过保留期后自动清理。当前保留：</span>
+              <span class="upd-val"><span id="trash-days">7</span> 天</span>
+              <button id="trash-clear" class="btn btn-soft mini btn-danger" style="margin-left:auto">清空回收站</button>
+            </div>
+          </div>
+          <div id="trash-list" class="mgr-list view-list" style="max-height:none"><div class="mgr-empty">加载中…</div></div>
+        </div>
+      </div>
+
+      <!-- ====== 修改目录视图 ====== -->
+      <div id="view-chdir" class="view hidden">
+        <div class="page-head">
+          <h1>修改目录</h1>
+        </div>
+        <div class="card chdir-card">
+          <div class="chdir-current">当前目录：<code id="chdir-current">—</code></div>
+          <div class="chdir-input">
+            <input id="chdir-path" class="input-sm" placeholder="直接输入服务器上的绝对路径，如 /mnt 或 D:\share" autocomplete="off">
+            <button id="chdir-go" class="btn btn-soft">转到</button>
+          </div>
+          <div id="dir-crumb" class="crumb crumb-modal"></div>
+          <div id="dir-list" class="dir-list"></div>
+          <div class="chdir-foot">
+            <button id="btn-dir-ok" class="btn btn-primary">选择当前目录</button>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div id="drop-mask" class="drop-mask hidden"><div>松开鼠标即可上传到当前目录</div></div>
+  <div id="toast" class="toast hidden"></div>
+</div>
+
+<!-- ====== 分享设置弹窗 ====== -->
+<div id="share-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>创建分享链接</h2>
+      <button class="icon-btn" data-close>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="file-preview">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>
+        <div><div id="share-filename" class="fp-name">—</div><div id="share-filesize" class="fp-size">—</div></div>
+      </div>
+
+      <div class="group">
+        <div class="group-title">有效期</div>
+        <div class="seg" id="seg-expire">
+          <button class="seg-item" data-sec="3600">1 小时</button>
+          <button class="seg-item" data-sec="21600">6 小时</button>
+          <button class="seg-item active" data-sec="86400">1 天</button>
+          <button class="seg-item" data-sec="604800">7 天</button>
+          <button class="seg-item" data-sec="2592000">30 天</button>
+          <button class="seg-item" data-sec="0">永久</button>
+        </div>
+        <div class="row">
+          <label class="switch">
+            <input type="checkbox" id="expire-custom-toggle"><span>自定义到期时间</span>
+          </label>
+          <input type="datetime-local" id="expire-custom" class="input-sm" disabled>
+        </div>
+      </div>
+
+      <div class="group">
+        <div class="group-title">下载次数</div>
+        <div class="seg" id="seg-count">
+          <button class="seg-item" data-count="1">1 次</button>
+          <button class="seg-item" data-count="5">5 次</button>
+          <button class="seg-item" data-count="20">20 次</button>
+          <button class="seg-item active" data-count="0">不限</button>
+          <input type="number" id="count-custom" class="input-sm num" min="0" placeholder="自定义">
+        </div>
+      </div>
+
+      <div class="group">
+        <div class="group-title">访问密码（可选）</div>
+        <input type="text" id="share-password" class="input-sm" placeholder="留空 = 无需密码" autocomplete="off">
+      </div>
+
+      <div class="group">
+        <div class="group-title">访问方式</div>
+        <div class="seg" id="seg-mode">
+          <button class="seg-item active" data-mode="direct">直链下载</button>
+          <button class="seg-item" data-mode="page">确认页</button>
+        </div>
+        <p class="hint">直链：打开链接即开始下载；确认页：先展示文件信息，点击下载按钮才计数。</p>
+      </div>
+
+      <div class="group">
+        <div class="group-title">链接协议（无 HTTPS 环境 / 路由器下载）</div>
+        <div class="seg" id="seg-scheme">
+          <button class="seg-item active" data-scheme="auto">自动识别</button>
+          <button class="seg-item" data-scheme="http">强制 HTTP</button>
+          <button class="seg-item" data-scheme="https">强制 HTTPS</button>
+        </div>
+        <input type="text" id="host-override" class="input-sm" placeholder="可选：自定义域名/IP:端口（留空则用当前前台域名）">
+      </div>
+
+      <div id="share-result" class="result hidden">
+        <div class="result-label">分享链接</div>
+        <div class="result-row">
+          <input id="share-url" class="input-url" readonly>
+          <button id="btn-copy" class="btn btn-primary">复制</button>
+        </div>
+        <div class="result-qr">
+          <canvas id="share-qr" width="10" height="10" title="扫码访问分享链接"></canvas>
+        </div>
+        <div id="share-meta" class="result-meta"></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-soft" data-close>关闭</button>
+      <button id="btn-gen" class="btn btn-primary">生成链接</button>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 输入 / 确认对话框（自定义样式，替代浏览器原生 prompt/confirm） ====== -->
+<div id="ask-modal" class="modal hidden">
+  <div class="modal-card ask-card">
+    <div class="modal-head"><h2 id="ask-title">—</h2></div>
+    <div class="modal-body">
+      <p id="ask-msg" class="ask-msg hidden"></p>
+      <input id="ask-input" class="input-sm hidden" autocomplete="off">
+    </div>
+    <div class="modal-foot">
+      <button id="ask-cancel" class="btn btn-soft">取消</button>
+      <button id="ask-ok" class="btn btn-primary">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 批量分享结果面板 ====== -->
+<div id="batch-modal" class="modal hidden">
+  <div class="modal-card ask-card">
+    <div class="modal-head"><h2>批量分享结果</h2></div>
+    <div class="modal-body">
+      <div id="batch-links" class="batch-links"></div>
+    </div>
+    <div class="modal-foot">
+      <button id="batch-copy-all" class="btn btn-primary">复制全部链接</button>
+      <button id="batch-close" class="btn btn-soft">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 移动目标选择器（自定义弹窗，复用目录浏览器） ====== -->
+<div id="move-modal" class="modal hidden">
+  <div class="modal-card ask-card">
+    <div class="modal-head"><h2 id="move-title">移动到…</h2></div>
+    <div class="modal-body">
+      <div class="move-target">目标目录：<code id="move-target">…</code></div>
+      <div id="move-crumb" class="crumb crumb-modal"></div>
+      <div id="move-list" class="dir-list"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-soft" data-close>取消</button>
+      <button id="move-ok" class="btn btn-primary">移动到当前目录</button>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 媒体预览弹窗（浏览器端渲染，不经服务端加工） ====== -->
+<div id="preview-modal" class="modal hidden">
+  <div class="modal-card preview-card">
+    <div class="modal-head">
+      <h2 id="preview-name">—</h2>
+      <button class="icon-btn" data-close>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body preview-body">
+      <img id="preview-img" class="hidden" alt="图片预览">
+      <video id="preview-video" class="hidden" controls playsinline></video>
+      <audio id="preview-audio" class="hidden" controls></audio>
+    </div>
+    <div class="modal-foot">
+      <span id="preview-info" class="preview-info"></span>
+      <a id="preview-dl" class="btn btn-soft" download>下载原文件</a>
+    </div>
+  </div>
+</div>
+
+<script src="/qr.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

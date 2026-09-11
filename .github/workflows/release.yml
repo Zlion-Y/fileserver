@@ -1,0 +1,87 @@
+name: Build Release
+
+# 推送 tag（如 v1.0.0）即自动交叉编译各平台单文件可执行程序并创建 Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64,        name: linux_amd64 }
+          - { goos: linux,   goarch: arm64,        name: linux_arm64 }
+          - { goos: linux,   goarch: arm, goarm: "7", name: linux_armv7 }
+          - { goos: linux,   goarch: arm, goarm: "5", name: linux_armv5 }
+          - { goos: linux,   goarch: "386",        name: linux_386 }
+          - { goos: linux,   goarch: mipsle,       name: linux_mipsle }
+          - { goos: windows, goarch: amd64,        name: windows_amd64 }
+          - { goos: darwin,  goarch: arm64,        name: darwin_arm64 }
+    steps:
+      # fetch-depth: 0 —— 必须拿全量历史与所有 tag，否则下面的 git tag / git log
+      # 拿不到上一个 tag，更新日志永远注入不进去（默认只取触发的那一个 ref）
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          out=fileserver_${{ matrix.name }}
+          if [ "${{ matrix.goos }}" = "windows" ]; then out="${out}.exe"; fi
+          # 必须注入 goarmBuild：运行期 assetName() 靠它拼出 fileserver_linux_armv5/v7，
+          # 缺失时 armv7 设备自更新会下载 armv5 产物（魔数校验能过，架构却是错的）
+          LDFLAGS="-s -w -X main.version=${GITHUB_REF_NAME} -X main.commit=$(git rev-parse --short HEAD) -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if [ -n "${GOARM:-}" ]; then LDFLAGS="${LDFLAGS} -X main.goarmBuild=${GOARM}"; fi
+          # 注入更新日志：上一 tag 到本 tag 的提交清单，程序内「检查更新」页离线展示。
+          # ldflags -X 不能直接带换行/引号/特殊字符（eval 重解析会炸），
+          # 改用 base64 编码后注入，运行期 main.go 里解码还原
+          CHANGELOG_B64=""
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${GITHUB_REF_NAME}$" | head -1 || true)
+          if [ -n "${PREV_TAG}" ]; then
+            CHANGELOG=$(git log --pretty=format:'- %s' "${PREV_TAG}..${GITHUB_REF_NAME}" | head -30 || true)
+            if [ -n "${CHANGELOG}" ]; then
+              HEADER="本次更新（${PREV_TAG} → ${GITHUB_REF_NAME}）的提交："
+              CHANGELOG_B64=$(printf '%s\n%s' "${HEADER}" "${CHANGELOG}" | base64 -w0 || true)
+              LDFLAGS="${LDFLAGS} -X main.changelogB64=${CHANGELOG_B64}"
+            fi
+          fi
+          go build -trimpath -ldflags "${LDFLAGS}" -o "$out" .
+          # 注意：${#VAR:-0} 不是合法参数展开（bash 报 bad substitution），
+          # GitHub Actions 的 run 默认 bash -eo pipefail，会直接让整个 Build 步骤失败。
+          # 取长度必须先给变量默认值，再单独用 ${#VAR}
+          echo "已构建 ${out}（GOARM=${GOARM:-未设置}，changelogB64 ${#CHANGELOG_B64} 字符）"
+          mkdir -p dist
+          mv "$out" dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fileserver_${{ matrix.name }}
+          path: dist/*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

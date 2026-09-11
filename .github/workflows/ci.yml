@@ -1,0 +1,75 @@
+name: CI
+
+# 每次 push / PR 都编译 + 冒烟测试，第一时间发现编译或运行问题
+on: [push, pull_request]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: gofmt 检查（不阻断）
+        continue-on-error: true
+        run: |
+          out=$(gofmt -l . | grep -v '^public/' || true)
+          if [ -n "$out" ]; then echo "以下文件未 gofmt 格式化："; echo "$out"; else echo "gofmt OK"; fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: 编译当前平台
+        run: go build -trimpath -ldflags "-s -w -X main.version=ci" -o /tmp/fileserver .
+
+      - name: 冒烟测试（启动 → 列表 → 上传 → 分享 → 限次下载）
+        run: |
+          set -e
+          rm -rf /tmp/fssmoke && mkdir -p /tmp/fssmoke/files /tmp/fssmoke/data
+          printf 'hello fileserver' > /tmp/fssmoke/files/a.txt
+          /tmp/fileserver --port 18080 --host 127.0.0.1 \
+            --dir /tmp/fssmoke/files --data-dir /tmp/fssmoke/data --log=false &
+          SRV=$!
+          trap 'kill $SRV 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:18080/healthz >/dev/null 2>&1 && break
+            sleep 0.3
+          done
+
+          echo "--- healthz ---"
+          curl -fsS http://127.0.0.1:18080/healthz; echo
+
+          echo "--- list ---"
+          curl -fsS 'http://127.0.0.1:18080/api/list?path=' | head -c 300; echo
+
+          echo "--- upload ---"
+          curl -fsS -X POST 'http://127.0.0.1:18080/api/upload?path=' \
+            -F 'files=@/tmp/fssmoke/files/a.txt;filename=b.txt'; echo
+
+          echo "--- share ---"
+          RESP=$(curl -fsS -X POST 'http://127.0.0.1:18080/api/share' \
+            -H 'Content-Type: application/json' \
+            -d '{"path":"b.txt","maxDownloads":1,"expireSeconds":3600}')
+          echo "$RESP"
+          TOKEN=$(echo "$RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["share"]["token"])')
+          echo "token=$TOKEN"
+
+          echo "--- download #1 (期望 200) ---"
+          curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:18080/s/$TOKEN"
+          echo "--- download #2 (期望 403，次数用完) ---"
+          curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:18080/s/$TOKEN"
+          echo "--- 路径穿越 (期望 400) ---"
+          curl -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:18080/api/list?path=../../etc'
+
+      # 直接复用 build.sh 的平台解析逻辑（这里手写过一版，因 ${t%/*} 对 linux/arm/7
+      # 解析成 GOOS=linux/arm 而失败，故统一收敛到 build.sh，避免两套逻辑再分叉）
+      - name: 交叉编译抽样（确认各平台都能编过）
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -e
+          bash build.sh linux/amd64 linux/arm64 linux/arm/7 linux/arm/5 \
+                        linux/386 linux/mipsle windows/amd64 darwin/arm64

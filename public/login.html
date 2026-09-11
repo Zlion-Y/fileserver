@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>FileHub - 登录</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📁</text></svg>">
+<style>
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: #F4F6FA; color: #000;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif;
+  display: flex; align-items: center; justify-content: center;
+  min-height: 100vh; min-height: 100dvh;
+  box-sizing: border-box;
+  padding: calc(20px + env(safe-area-inset-top)) calc(20px + env(safe-area-inset-right))
+           calc(20px + env(safe-area-inset-bottom)) calc(20px + env(safe-area-inset-left));
+}
+.card {
+  background: #fff; border-radius: 18px; padding: 36px 30px;
+  width: min(400px, 94vw); box-shadow: 0 10px 40px rgba(0,0,0,.06);
+}
+.ic {
+  width: 56px; height: 56px; margin: 0 auto 14px; border-radius: 14px;
+  background: rgba(0,122,255,.1); color: #2563EB;
+  display: flex; align-items: center; justify-content: center;
+}
+.ic svg { width: 28px; height: 28px; }
+h1 { font-size: 19px; text-align: center; margin: 0 0 4px; }
+.sub { font-size: 13px; color: rgba(60,60,67,.6); text-align: center; margin: 0 0 22px; }
+label { display: block; font-size: 13px; color: rgba(60,60,67,.6); margin: 14px 0 6px; }
+input {
+  width: 100%; height: 46px; border: 1px solid rgba(60,60,67,.13);
+  border-radius: 10px; padding: 0 12px; font-size: 16px; outline: none;
+  transition: border-color .15s, box-shadow .15s;
+}
+input:focus { border-color: #2563EB; box-shadow: 0 0 0 3px rgba(0,122,255,.12); }
+button {
+  width: 100%; height: 46px; border: 0; border-radius: 12px;
+  background: #2563EB; color: #fff; font-size: 15px; font-weight: 500;
+  cursor: pointer; margin-top: 24px;
+}
+button:active { opacity: .85; }
+button:disabled { opacity: .5; cursor: default; }
+.err { color: #FF3B30; font-size: 13px; margin-top: 12px; text-align: center; min-height: 18px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="ic">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>
+    </svg>
+  </div>
+  <h1>FileHub</h1>
+  <p class="sub">请登录后继续</p>
+  <form id="form">
+    <label for="user">用户名</label>
+    <input id="user" type="text" autocomplete="username" autofocus>
+    <label for="pass">密码</label>
+    <input id="pass" type="password" autocomplete="current-password">
+    <button type="submit" id="btn">登录</button>
+    <div class="err" id="err"></div>
+  </form>
+</div>
+<script>
+'use strict';
+const form = document.getElementById('form');
+const btn = document.getElementById('btn');
+const err = document.getElementById('err');
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const user = document.getElementById('user').value.trim();
+  const pass = document.getElementById('pass').value;
+  if (!user || !pass) { err.textContent = '请输入用户名和密码'; return; }
+  btn.disabled = true; err.textContent = '';
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user: user, pass: pass })
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) {
+      location.href = '/';
+      return;
+    }
+    err.textContent = d.error || ('登录失败 ' + r.status);
+  } catch (ex) {
+    err.textContent = '网络错误，请重试';
+  }
+  btn.disabled = false;
+});
+</script>
+</body>
+</html>

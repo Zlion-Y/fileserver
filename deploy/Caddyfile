@@ -1,0 +1,9 @@
+# /etc/caddy/Caddyfile —— Caddy 会自动签发 HTTPS 证书
+file.example.com {
+	reverse_proxy 127.0.0.1:16666 {
+		flush_interval -1      # 大文件流式传输，不缓冲
+	}
+	request_body {
+		max_size 100GB        # 上传大小上限
+	}
+}

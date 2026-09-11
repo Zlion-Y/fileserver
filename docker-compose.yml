@@ -1,0 +1,26 @@
+services:
+  fileserver:
+    build: .
+    # 也可以直接用现成镜像：image: ghcr.io/xxx/fileserver:latest
+    container_name: fileserver
+    restart: unless-stopped
+    ports:
+      # 仅监听本机，由 Nginx/Caddy 反代后对外；不用反代就改成 "8080:8080"
+      - "127.0.0.1:16666:8080"
+    environment:
+      PORT: 8080
+      # 文件根目录（容器内路径），映射到宿主机 ./files
+      ROOT_DIR: /files
+      # 配置与分享记录存放位置（必须持久化，否则分享链接重启即失效）
+      DATA_DIR: /app/data
+      # 走反向代理时必须为 1，分享链接才会用真实域名/协议
+      TRUST_PROXY: "1"
+      # 管理端访问密码（强烈建议设置，分享下载链接不受影响）
+      AUTH_USER: admin
+      AUTH_PASS: "change-me-please"
+      # 单文件上传上限（MB），0 表示不限制
+      MAX_UPLOAD_MB: "0"
+      LOG: "1"
+    volumes:
+      - ./files:/files
+      - ./data:/app/data

@@ -1,0 +1,27 @@
+[Unit]
+Description=Self-hosted File Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+# 手动套用本模板时 /opt/fileserver 可能不存在，systemd 会因 CHDIR 失败而启动不了，故先创建
+ExecStartPre=/bin/mkdir -p /opt/fileserver /opt/fileserver/data
+WorkingDirectory=/opt/fileserver
+Environment=PORT=16666
+Environment=HOST=0.0.0.0
+Environment=ROOT_DIR=/data/files
+Environment=DATA_DIR=/opt/fileserver/data
+Environment=TRUST_PROXY=1
+Environment=AUTH_USER=admin
+Environment=AUTH_PASS=change-me-please
+Environment=MAX_UPLOAD_MB=0
+Environment=LOG=1
+ExecStart=/usr/local/bin/fileserver --port 16666 --dir /data/files --data-dir /opt/fileserver/data --trust-proxy
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
