@@ -369,95 +369,6 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; color:
 .chip:hover { border-color: var(--primary); color: var(--primary); }
 .setup-card .hint { font-size: 12px; color: var(--t3); margin: 14px 0 0; }
 
-/* ---------- 响应式 ---------- */
-/* 说明：viewport-fit=cover 之下内容会铺到刘海/Home 指示条区域，
-   因此所有贴边元素都要留 env(safe-area-inset-*)；
-   高度用 dvh（iOS 地址栏收纳时 vh 会把底栏顶出屏幕，dvh 不会，不支持的浏览器自动回落到 vh）。 */
-@media (max-width: 860px) {
-  .app { flex-direction: column; min-height: 100dvh; }
-  /* 移动端：侧边栏变为顶部标签栏——单行横向滚动，不换行不竖排，
-     长标题（深色模式/退出登录）与英文内容都不会撑坏布局 */
-  .sidebar {
-    width: 100%; height: auto; position: sticky; top: 0; z-index: 20;
-    flex-direction: row; align-items: center; flex-wrap: nowrap;
-    gap: 2px; border-right: 0; border-bottom: 1px solid var(--line);
-    padding: calc(8px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) 8px
-             calc(12px + env(safe-area-inset-left));
-    overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
-  }
-  .sidebar::-webkit-scrollbar { display: none; }
-  .logo { padding: 0 8px 0 0; flex-shrink: 0; font-size: 15px; }
-  .logo-ic { width: 26px; height: 26px; }
-  .nav { flex-direction: row; flex-wrap: nowrap; flex: 0 0 auto; gap: 2px; }
-  .nav-group { display: none; }
-  /* 触控目标：原来的 32px 高度在手机上极易误触，按 44px 重排 */
-  .nav-item {
-    width: auto; padding: 0 12px; height: 44px; font-size: 13px;
-    flex-shrink: 0; white-space: nowrap;
-  }
-  .nav-item svg { width: 18px; height: 18px; }
-  .sidebar-foot {
-    border-top: 0; border-left: 1px solid var(--line); padding: 0 0 0 8px; margin: 0 0 0 auto;
-    display: flex; align-items: center; gap: 4px; flex-shrink: 0; flex-direction: row;
-  }
-  #theme-label { display: none; } /* 主题按钮只留图标，文字太长易溢出 */
-  .disk-mini { display: none; }
-  .page { padding: 14px 12px calc(30px + env(safe-area-inset-bottom)); }
-  .topbar { padding: 10px 12px; }
-  .disk-card { width: 100%; order: 2; }
-  .page-head { flex-direction: column; }
-  .page-head h1 { font-size: 20px; }
-  .crumb { order: 3; }
-  /* 窄屏只隐藏「类型」(3) 与「大小」(4) 两列。
-     注意：这里原来写的是 nth-child(2)，而第 2 列正是【唯一的文件名单元格】，
-     导致手机上列表里根本看不到文件名，整页不可用——务必保持文件名可见。 */
-  .table th:nth-child(3), .table td:nth-child(3),
-  .table th:nth-child(4), .table td:nth-child(4) { display: none; }
-  /* iOS Safari：聚焦字号 < 16px 的输入框会把整页自动放大，且难以复位 */
-  .search-wrap input, .input-sm, .input-url { font-size: 16px; }
-  .search-wrap { height: 42px; }
-  .input-sm, .input-url { height: 42px; }
-  /* 按钮/分段控件/复选框同样按触控目标放大 */
-  .btn { height: 42px; font-size: 14.5px; }
-  .btn.mini, .btn-mini { height: 34px; padding: 0 11px; font-size: 12.5px; }
-  .seg-item { height: 38px; padding: 0 14px; font-size: 13px; }
-  .icon-btn { width: 44px; height: 44px; }
-  .row-check { width: 20px; height: 20px; }
-  .crumb button { padding: 7px 6px; font-size: 14px; }
-  /* 弹窗在窄屏占满宽度、贴底（分享表单字段多，宽度优先），并避开安全区 */
-  .modal {
-    padding: 12px;
-    padding-bottom: calc(12px + env(safe-area-inset-bottom));
-    align-items: stretch;
-  }
-  .modal-card { width: 100%; max-height: 92dvh; }
-  .modal-foot { flex-wrap: wrap; }
-  .actions-row { gap: 8px; }
-  .table-top { padding: 8px 10px; }
-  .table-top-right { gap: 6px; }
-  /* 贴顶/贴底的悬浮元素避开刘海与 Home 指示条 */
-  .toast { top: calc(22px + env(safe-area-inset-top)); }
-  .progress-card {
-    left: 12px; right: 12px; width: auto;
-    bottom: calc(24px + env(safe-area-inset-bottom));
-  }
-  /* 首次设置页：同样避免 iOS 聚焦缩放与安全区遮挡 */
-  .setup {
-    min-height: 100dvh;
-    padding: calc(20px + env(safe-area-inset-top)) calc(20px + env(safe-area-inset-right))
-             calc(20px + env(safe-area-inset-bottom)) calc(20px + env(safe-area-inset-left));
-  }
-  .setup-card { padding: 28px 20px; }
-  .setup-card .field input { height: 46px; font-size: 16px; }
-  .chip { height: 34px; padding: 0 14px; font-size: 13px; }
-  /* 空状态提示：允许中文正常断行（保留词语完整） */
-  .mgr-empty { padding: 28px 16px; word-break: keep-all; overflow-wrap: anywhere; }
-  .empty p { word-break: keep-all; overflow-wrap: anywhere; }
-  /* 回收站页头工具行：按钮换行排列不溢出 */
-  .tidy-hours-row { row-gap: 8px; }
-}
-
 /* ---------- 视图切换 ---------- */
 .view { display: block; }
 .view.hidden { display: none !important; }
@@ -665,3 +576,154 @@ html[data-theme="dark"] .preview-body { background: rgba(0,0,0,.3); }
 
 /* ---------- 主题切换按钮 ---------- */
 #btn-theme svg { width: 17px; height: 17px; flex-shrink: 0; }
+
+/* ---------- 响应式 ---------- */
+/* 说明：viewport-fit=cover 之下内容会铺到刘海/Home 指示条区域，
+   因此所有贴边元素都要留 env(safe-area-inset-*)；
+   高度用 dvh（iOS 地址栏收纳时 vh 会把底栏顶出屏幕，dvh 不会，不支持的浏览器自动回落到 vh）。 */
+@media (max-width: 860px) {
+  .app { flex-direction: column; min-height: 100dvh; }
+  /* 移动端：侧边栏变为顶部标签栏——单行横向滚动，不换行不竖排，
+     长标题（深色模式/退出登录）与英文内容都不会撑坏布局 */
+  .sidebar {
+    width: 100%; height: auto; position: sticky; top: 0; z-index: 20;
+    flex-direction: row; align-items: center; flex-wrap: nowrap;
+    gap: 2px; border-right: 0; border-bottom: 1px solid var(--line);
+    padding: calc(8px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) 8px
+             calc(12px + env(safe-area-inset-left));
+    overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .sidebar::-webkit-scrollbar { display: none; }
+  .logo { padding: 0 8px 0 0; flex-shrink: 0; font-size: 0; } /* 手机上只留图标，多让出 ~75px 给标签 */
+  .logo-ic { width: 26px; height: 26px; }
+  .nav { flex-direction: row; flex-wrap: nowrap; flex: 0 0 auto; gap: 2px; }
+  .nav-group { display: none; }
+  /* 触控目标：原来的 32px 高度在手机上极易误触，按 44px 重排 */
+  .nav-item {
+    width: auto; padding: 0 12px; height: 44px; font-size: 13px;
+    flex-shrink: 0; white-space: nowrap;
+  }
+  .nav-item svg { width: 18px; height: 18px; }
+  .sidebar-foot {
+    border-top: 0; border-left: 1px solid var(--line); padding: 0 0 0 8px; margin: 0 0 0 auto;
+    display: flex; align-items: center; gap: 4px; flex-shrink: 0; flex-direction: row;
+  }
+  #theme-label { display: none; } /* 主题按钮只留图标，文字太长易溢出 */
+  .disk-mini { display: none; }
+  .page { padding: 14px 12px calc(30px + env(safe-area-inset-bottom)); }
+  .topbar { padding: 10px 12px; }
+  /* 磁盘胶囊 flex-shrink:0 且内容宽 ~270px，是把页面撑出横向滚动的主因：
+     手机上只留 图标 + 百分比 + 进度条，并允许收缩 */
+  #disk-pill { flex-shrink: 1; min-width: 0; padding: 0 10px; gap: 6px; }
+  #disk-pill .pill-label, #disk-pill .pill-free { display: none; }
+  #disk-pill .pill-bar { width: 44px; flex-shrink: 0; }
+  /* 顶部标签栏改为换行：整条需要 ~970px，横向滚动会让「深色模式/退出登录」
+     永远不可见；换行后两行放得下全部入口 */
+  .sidebar {
+    flex-wrap: wrap; overflow-x: visible; overflow-y: hidden;
+    row-gap: 2px;
+  }
+  .nav { flex-wrap: wrap; flex: 1 1 auto; row-gap: 2px; }
+  .sidebar-foot { border-left: 0; padding-left: 0; margin: 0 0 0 auto; }
+  .disk-card { width: 100%; order: 2; }
+  .page-head { flex-direction: column; }
+  .page-head h1 { font-size: 20px; }
+  .crumb { order: 3; }
+  /* 窄屏只隐藏「类型」(3) 与「大小」(4) 两列。
+     注意：这里原来写的是 nth-child(2)，而第 2 列正是【唯一的文件名单元格】，
+     导致手机上列表里根本看不到文件名，整页不可用——务必保持文件名可见。 */
+  .table th:nth-child(3), .table td:nth-child(3),
+  .table th:nth-child(4), .table td:nth-child(4) { display: none; }
+
+  /* ---- 文件列表改为卡片式行布局 ----
+     390px 宽下表格放不下 5 列，「操作」列会被整列挤出屏幕，必须横向滚动
+     才能点到下载/删除，等于不可用。改成两行网格：
+       第 1 行  勾选 | 文件名 | 修改时间
+       第 2 行  操作按钮（占满整行，可横滑不换行）
+     「分享状态」在手机上隐藏，完整列表见「分享管理」页 */
+  .table thead {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px; background: var(--surface-2);
+    border-bottom: 1px solid var(--line);
+  }
+  .table thead tr { display: contents; }
+  .table thead th { padding: 0; border: 0; background: none; white-space: nowrap; font-size: 12.5px; }
+  .table thead th:nth-child(n+3) { display: none; } /* 表头只留 全选 + 「文件名」 */
+  .table, .table tbody, .table tbody tr, .table tbody td { display: block; }
+  #list tr { height: auto; }               /* 覆盖桌面的固定 54px 行高 */
+  .table tbody tr {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    column-gap: 10px; row-gap: 9px;
+    padding: 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  .table tbody td { padding: 0; border: 0; }
+  .table tbody td:nth-child(1) { grid-column: 1; grid-row: 1; }  /* 勾选 */
+  .table tbody td:nth-child(2) { grid-column: 2; grid-row: 1; min-width: 0; }  /* 文件名 */
+  .table tbody td:nth-child(5) { grid-column: 3; grid-row: 1; }  /* 修改时间 */
+  .table tbody td:nth-child(6) { display: none; }                /* 分享状态 */
+  .table tbody td:nth-child(7) { grid-column: 1 / -1; grid-row: 2; }  /* 操作 */
+  /* 行内操作不换行、可横滑，避免把行撑得很高 */
+  .table tbody td:nth-child(7) .cell-actions {
+    flex-wrap: nowrap; overflow-x: auto; padding-bottom: 2px; scrollbar-width: none;
+  }
+  .table tbody td:nth-child(7) .cell-actions::-webkit-scrollbar { display: none; }
+  body #list tr td .name-text { max-width: none; }  /* 覆盖桌面 420px 截断 */
+  /* 虚拟滚动的占位行 / 加载更多行不参与上面的网格 */
+  #list tr.vspace, #list tr.vmore { display: block; padding: 0; }
+  #list tr.vmore td { padding: 12px; }
+
+  /* 「文件列表」标题与面包屑在手机上重复，文件视图不再显示大标题 */
+  #view-files .page-head { display: none; }
+  /* 「大小」筛选是手机上最少用的一项，隐藏后排序/类型筛选能排进一行 */
+  #size-select { display: none; }
+  .table-top { flex-wrap: wrap; row-gap: 8px; }
+  .table-top .count-info { width: 100%; margin: 0; }
+  .table-top .input-sm { height: 38px; }
+
+  /* iOS Safari：聚焦字号 < 16px 的输入框会把整页自动放大，且难以复位 */
+  .search-wrap input, .input-sm, .input-url { font-size: 16px; }
+  .search-wrap { height: 42px; }
+  .input-sm, .input-url { height: 42px; }
+  /* 按钮/分段控件/复选框同样按触控目标放大 */
+  .btn { height: 42px; font-size: 14.5px; }
+  .btn.mini, .btn-mini { height: 34px; padding: 0 11px; font-size: 12.5px; }
+  .seg-item { height: 38px; padding: 0 14px; font-size: 13px; }
+  .icon-btn { width: 44px; height: 44px; }
+  .row-check { width: 20px; height: 20px; }
+  .crumb button { padding: 7px 6px; font-size: 14px; }
+  /* 弹窗在窄屏占满宽度、贴底（分享表单字段多，宽度优先），并避开安全区 */
+  .modal {
+    padding: 12px;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+    align-items: stretch;
+  }
+  .modal-card { width: 100%; max-height: 92dvh; }
+  .modal-foot { flex-wrap: wrap; }
+  .actions-row { gap: 8px; }
+  .table-top { padding: 8px 10px; }
+  .table-top-right { gap: 6px; }
+  /* 贴顶/贴底的悬浮元素避开刘海与 Home 指示条 */
+  .toast { top: calc(22px + env(safe-area-inset-top)); }
+  .progress-card {
+    left: 12px; right: 12px; width: auto;
+    bottom: calc(24px + env(safe-area-inset-bottom));
+  }
+  /* 首次设置页：同样避免 iOS 聚焦缩放与安全区遮挡 */
+  .setup {
+    min-height: 100dvh;
+    padding: calc(20px + env(safe-area-inset-top)) calc(20px + env(safe-area-inset-right))
+             calc(20px + env(safe-area-inset-bottom)) calc(20px + env(safe-area-inset-left));
+  }
+  .setup-card { padding: 28px 20px; }
+  .setup-card .field input { height: 46px; font-size: 16px; }
+  .chip { height: 34px; padding: 0 14px; font-size: 13px; }
+  /* 空状态提示：允许中文正常断行（保留词语完整） */
+  .mgr-empty { padding: 28px 16px; word-break: keep-all; overflow-wrap: anywhere; }
+  .empty p { word-break: keep-all; overflow-wrap: anywhere; }
+  /* 回收站页头工具行：按钮换行排列不溢出 */
+  .tidy-hours-row { row-gap: 8px; }
+}

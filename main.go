@@ -310,15 +310,21 @@ func enrichNotes(tag, body string) string {
 	if !isAutoNotes(body) {
 		return body
 	}
-	base := prevTagOf(tag)
-	if base == "" {
+	var out string
+	if base := prevTagOf(tag); base != "" {
+		if cs, err := commitsBetween(base, tag); err == nil && strings.TrimSpace(cs) != "" {
+			out = "本次更新的提交：\n" + cs
+		}
+	} else {
+		// 没有上一个版本可比（仓库首个发布）：列出该 tag 自身包含的提交。
+		// 否则首版只会显示 GitHub 自动生成的「**Full Changelog**: …」原始文本
+		if cs, err := commitsOfRef(tag); err == nil && strings.TrimSpace(cs) != "" {
+			out = "本次发布包含的提交：\n" + cs
+		}
+	}
+	if strings.TrimSpace(out) == "" {
 		return body
 	}
-	cs, err := commitsBetween(base, tag)
-	if err != nil || strings.TrimSpace(cs) == "" {
-		return body
-	}
-	out := "本次更新的提交：\n" + cs
 	if t := strings.TrimSpace(body); t != "" {
 		out += "\n" + t
 	}
@@ -350,6 +356,32 @@ func commitsBetween(base, head string) (string, error) {
 	n := 0
 	for i := len(cmp.Commits) - 1; i >= 0 && n < 30; i-- {
 		msg := strings.TrimSpace(strings.SplitN(cmp.Commits[i].Commit.Message, "\n", 2)[0])
+		if msg == "" {
+			continue
+		}
+		b.WriteString("- " + msg + "\n")
+		n++
+	}
+	return b.String(), nil
+}
+
+// commitsOfRef 取某个 ref（tag / 分支）上的提交记录（旧 -> 新，最多 30 条）。
+// 用于没有「上一个版本」可比的首个发布：这样首版的「检查更新」页也能看到
+// 实际的提交清单，而不是 GitHub 自动生成的 Full Changelog 链接
+func commitsOfRef(ref string) (string, error) {
+	var list []struct {
+		Commit struct {
+			Message string `json:"message"`
+		} `json:"commit"`
+	}
+	if err := ghGetJSON(fmt.Sprintf("https://api.github.com/repos/%s/commits?sha=%s&per_page=30",
+		updateRepo, url.PathEscape(ref)), &list); err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	n := 0
+	for i := len(list) - 1; i >= 0 && n < 30; i-- {
+		msg := strings.TrimSpace(strings.SplitN(list[i].Commit.Message, "\n", 2)[0])
 		if msg == "" {
 			continue
 		}

@@ -48,16 +48,21 @@ jobs:
           if [ -n "${GOARM:-}" ]; then LDFLAGS="${LDFLAGS} -X main.goarmBuild=${GOARM}"; fi
           # 注入更新日志：上一 tag 到本 tag 的提交清单，程序内「检查更新」页离线展示。
           # ldflags -X 不能直接带换行/引号/特殊字符（eval 重解析会炸），
-          # 改用 base64 编码后注入，运行期 main.go 里解码还原
+          # 改用 base64 编码后注入，运行期 main.go 里解码还原。
+          # 没有上一个 tag（仓库首个发布）时退化为「全部提交」，
+          # 否则程序内更新日志会是空的，只能看到 GitHub 自动生成的 Full Changelog 链接
           CHANGELOG_B64=""
           PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${GITHUB_REF_NAME}$" | head -1 || true)
           if [ -n "${PREV_TAG}" ]; then
             CHANGELOG=$(git log --pretty=format:'- %s' "${PREV_TAG}..${GITHUB_REF_NAME}" | head -30 || true)
-            if [ -n "${CHANGELOG}" ]; then
-              HEADER="本次更新（${PREV_TAG} → ${GITHUB_REF_NAME}）的提交："
-              CHANGELOG_B64=$(printf '%s\n%s' "${HEADER}" "${CHANGELOG}" | base64 -w0 || true)
-              LDFLAGS="${LDFLAGS} -X main.changelogB64=${CHANGELOG_B64}"
-            fi
+            HEADER="本次更新（${PREV_TAG} → ${GITHUB_REF_NAME}）的提交："
+          else
+            CHANGELOG=$(git log --pretty=format:'- %s' -30 || true)
+            HEADER="本次发布（${GITHUB_REF_NAME}）包含的提交："
+          fi
+          if [ -n "${CHANGELOG}" ]; then
+            CHANGELOG_B64=$(printf '%s\n%s' "${HEADER}" "${CHANGELOG}" | base64 -w0 || true)
+            LDFLAGS="${LDFLAGS} -X main.changelogB64=${CHANGELOG_B64}"
           fi
           go build -trimpath -ldflags "${LDFLAGS}" -o "$out" .
           # 注意：${#VAR:-0} 不是合法参数展开（bash 报 bad substitution），
