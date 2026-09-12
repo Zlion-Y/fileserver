@@ -84,6 +84,7 @@ on('#btn-theme', 'click', () => {
   document.documentElement.dataset.theme = next;
   try { localStorage.setItem('fh-theme', next); } catch (e) {}
   applyThemeUI();
+  if (statsDays) drawStatsChart(); // 图表配色跟随主题
 });
 applyThemeUI();
 
@@ -194,7 +195,7 @@ function switchView(name) {
   if (tb) tb.classList.toggle('hidden', !inFiles);
   const cb = $('#crumbbar');
   if (cb) cb.classList.toggle('hidden', !inFiles);
-  if (name === 'shares') loadShares();
+  if (name === 'shares') { loadShares(); loadStats(); }
   if (name === 'update') loadVersionInfo();
   if (name === 'security') loadSessionsList();
   if (name === 'chdir') enterChdirView();
@@ -367,12 +368,89 @@ function renderTable(entries, opts) {
     shown.forEach(e => list.appendChild(buildRow(e, true)));
   } else {
     pageState.search = false;
-    renderVirtual();
+    if (galleryOn) renderGallery();
+    else renderVirtual();
   }
   const ci = $('#count-info');
   if (ci) ci.textContent = searchMode ? `共 ${pageState.items.length} 个结果` : `共 ${pageState.total || pageState.items.length} 项`;
   updateBatchUI();
 }
+
+/* ---------------- 相册视图 ----------------
+   图片文件夹的缩略图网格：服务端仍只吐原始文件字节，<img loading=lazy>
+   让浏览器只拉取滚入视口的图片（客户端渲染，零服务端加工） */
+let galleryOn = false;
+try { galleryOn = localStorage.getItem('fh-gallery') === '1'; } catch (e) {}
+
+function applyGalleryBtn() {
+  const b = $('#btn-gallery');
+  if (!b) return;
+  b.textContent = galleryOn ? '列表' : '相册';
+  b.classList.toggle('btn-primary', galleryOn);
+  b.classList.toggle('btn-soft', !galleryOn);
+}
+
+function renderGallery() {
+  const g = $('#gallery');
+  const wrap = document.querySelector('.table-wrap');
+  if (!g) return;
+  g.classList.toggle('hidden', !galleryOn);
+  if (wrap) wrap.classList.toggle('hidden', galleryOn);
+  if (!galleryOn) return;
+  g.innerHTML = '';
+  const frag = document.createDocumentFragment();
+  (pageState.items || []).forEach(e => {
+    const rel = joinPath(e.dirPath || '', e.name);
+    const tile = document.createElement('div');
+    tile.className = 'g-tile';
+    const kind = typeKind(e);
+    const thumb = document.createElement('div');
+    thumb.className = 'g-thumb';
+    if (!e.isDir && kind === 'img') {
+      const img = document.createElement('img');
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      img.alt = e.name;
+      img.src = '/api/download?path=' + encodeURIComponent(rel);
+      thumb.appendChild(img);
+    } else {
+      thumb.innerHTML = `<div class="fi ${kind === 'dir' ? 'dir' : 'k-' + kind}">${KIND_SVG[kind]}</div>`;
+    }
+    const cap = document.createElement('div');
+    cap.className = 'g-name';
+    cap.textContent = e.name;
+    cap.title = e.isDir ? e.name : `${e.name} · ${fmtSize(e.size)}`;
+    tile.appendChild(thumb);
+    tile.appendChild(cap);
+    tile.addEventListener('click', () => {
+      if (e.isDir) { clearSearch(); loadList(rel); return; }
+      if (extKindOf(e.name)) { openPreview(rel, e.name, e.size); return; }
+      location.href = '/api/download?path=' + encodeURIComponent(rel);
+    });
+    frag.appendChild(tile);
+  });
+  g.appendChild(frag);
+  // 分页加载与表格共用同一 loadListMore；此处补一个「加载更多」入口
+  if (pageState.hasMore) {
+    const more = document.createElement('div');
+    more.className = 'g-more';
+    more.textContent = `已加载 ${(pageState.items || []).length}/${pageState.total} 项，点击加载更多…`;
+    more.addEventListener('click', () => loadListMore(true));
+    g.appendChild(more);
+  }
+}
+// 列表/相册统一刷新入口（数据变化后调用）
+function refreshListView() {
+  if (pageState.search) renderTable(pageState.items, { search: true });
+  else renderTable(pageState.items);
+}
+on('#btn-gallery', 'click', () => {
+  galleryOn = !galleryOn;
+  try { localStorage.setItem('fh-gallery', galleryOn ? '1' : '0'); } catch (e) {}
+  applyGalleryBtn();
+  refreshListView();
+});
+applyGalleryBtn();
 
 /* ---------------- 虚拟滚动 + 分页加载 ----------------
    大目录（几千项）不再全量渲染 DOM：只保留可见窗口内的行（上下用占位行撑高），
@@ -564,7 +642,7 @@ async function loadListMore(force) {
       pageState.total = d.total != null ? d.total : pageState.items.length;
       pageState.hasMore = !!d.hasMore;
       pageState.loading = false;
-      renderVirtual();
+      if (galleryOn) renderGallery(); else renderVirtual();
       const ci = $('#count-info');
       if (ci) ci.textContent = `共 ${pageState.total} 项`;
       updateBatchUI();
@@ -604,6 +682,33 @@ let searchTimer = null;
 on('#search-input', 'input', () => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(runSearch, 350);
+});
+// 记住排序/筛选选择：刷新后保持上次的列表视图偏好（纯前端，无服务端开销）
+['#sort-select', '#filter-select', '#size-select'].forEach(sel => {
+  const el = $(sel);
+  if (!el) return;
+  const key = 'fh-' + sel.slice(1);
+  try {
+    const saved = localStorage.getItem(key);
+    if (saved && [...el.options].some(o => o.value === saved)) el.value = saved;
+  } catch (e) {}
+  el.addEventListener('change', () => { try { localStorage.setItem(key, el.value); } catch (e) {} });
+});
+// 「/」聚焦搜索框（桌面效率键）；输入框内 Esc 清空搜索
+document.addEventListener('keydown', (e) => {
+  if (e.key === '/' && document.activeElement !== $('#search-input')) {
+    const tag = (document.activeElement || {}).tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    e.preventDefault();
+    const si = $('#search-input');
+    if (si) si.focus();
+  }
+});
+on('#search-input', 'keydown', (e) => {
+  if (e.key === 'Escape' && e.target.value) {
+    e.stopPropagation();
+    clearSearch(); loadList(state.curPath);
+  }
 });
 async function runSearch() {
   const si = $('#search-input');
@@ -882,10 +987,136 @@ async function mkdirAction() {
   } catch (e) { toast(e.message); }
 }
 
-/* ---------------- 上传 ---------------- */
+/* ---------------- 上传 ----------------
+   统一管线 sendFile：小文件走原 multipart 单请求；≥8MB 走分片断点续传
+   （init → 逐片 PUT 追加 → complete 原子改名），网络抖动只补缺失分片 */
 on('#btn-upload', 'click', () => { const f = $('#file-input'); if (f) f.click(); });
 on('#file-input', 'change', (e) => { uploadFiles(e.target.files); e.target.value = ''; });
 on('#btn-mkdir', 'click', () => mkdirAction());
+
+const CHUNK_THRESHOLD = 8 * 1024 * 1024; // 超过 8MB 启用分片上传
+const CHUNK_SIZE = 4 * 1024 * 1024;      // 每片 4MB
+const CHUNK_RETRY = 3;                   // 单片重试次数
+
+// xhrSend Promise 化 XHR；返回解析后的 JSON，非 2xx 抛错（err.status/err.data 带详情）
+function xhrSend(xhr, body, onProgress) {
+  return new Promise((resolve, reject) => {
+    if (xhr.upload) xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
+    };
+    xhr.onload = () => {
+      let data = null;
+      try { data = JSON.parse(xhr.responseText); } catch (e) {}
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data || {});
+      else {
+        const err = new Error((data && data.error) || ('请求失败 ' + xhr.status));
+        err.status = xhr.status; err.data = data;
+        reject(err);
+      }
+    };
+    xhr.onerror = () => reject(new Error('网络错误'));
+    xhr.send(body);
+  });
+}
+
+// uploadSimple 小文件：一次 multipart 直传
+async function uploadSimple(file, dirPath, onProgress) {
+  const fd = new FormData();
+  fd.append('files', file, file.name);
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/upload?path=' + encodeURIComponent(dirPath));
+  return xhrSend(xhr, fd, onProgress);
+}
+
+// uploadChunked 大文件：init → 逐片顺序追加 → complete。
+// 每片从「服务端已收字节数」处续传：409 冲突按服务端进度校正，网络错误重试，
+// 会话丢失（服务重启）自动重新 init 从头再传
+async function uploadChunked(file, dirPath, onProgress) {
+  const init = await api('/api/upload/init', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dir: dirPath, name: file.name, size: file.size })
+  });
+  let id = init.id, done = 0, restarts = 0;
+  const prog = (n) => { if (onProgress) onProgress(Math.max(n, 0), file.size); };
+  while (done < file.size) {
+    const end = Math.min(done + CHUNK_SIZE, file.size);
+    let attempt = 0, restart = false;
+    for (;;) {
+      try {
+        const xhr = new XMLHttpRequest();
+        xhr.open('PUT', '/api/upload/chunk?id=' + encodeURIComponent(id) + '&offset=' + done);
+        await xhrSend(xhr, file.slice(done, end), (loaded) => prog(done + loaded));
+        done = end;
+        break;
+      } catch (e) {
+        if (e.status === 409 && e.data && typeof e.data.received === 'number') {
+          done = Math.min(e.data.received, file.size); // 按服务端真实进度续传
+          break;
+        }
+        if (e.status === 404 && e.data && e.data.code === 'NO_SESSION') {
+          if (++restarts > 3) throw e;
+          restart = true;
+          break;
+        }
+        if (++attempt >= CHUNK_RETRY) throw e;
+        await new Promise(r => setTimeout(r, 600 * attempt));
+      }
+    }
+    if (restart) {
+      const again = await api('/api/upload/init', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dir: dirPath, name: file.name, size: file.size })
+      });
+      id = again.id; done = 0; prog(0);
+    }
+  }
+  await api('/api/upload/complete?id=' + encodeURIComponent(id), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+  });
+}
+
+// sendFile 统一入口：按大小自动选择上传方式
+function sendFile(file, dirPath, onProgress) {
+  if (file.size >= CHUNK_THRESHOLD) return uploadChunked(file, dirPath, onProgress);
+  return uploadSimple(file, dirPath, onProgress);
+}
+
+// 多文件顺序上传：进度条按「累计字节 / 总字节」推进，单个失败不阻断后续
+async function uploadFiles(files) {
+  const arr = Array.from(files || []);
+  if (!arr.length) return;
+  const totalBytes = arr.reduce((s, f) => s + f.size, 0) || 1;
+  let sent = 0, ok = 0, fail = 0;
+  const failMsgs = [];
+  const card = $('#upload-progress');
+  if (card) card.classList.remove('hidden');
+  const bar = $('#progress-bar'), pp = $('#progress-pct'), pn = $('#progress-name');
+  const paint = (n) => {
+    const pct = Math.min(100, Math.round(n / totalBytes * 100));
+    if (bar) bar.style.width = pct + '%';
+    if (pp) pp.textContent = pct + '%';
+  };
+  for (const f of arr) {
+    if (pn) pn.textContent = arr.length > 1 ? `上传 ${ok + fail + 1}/${arr.length}：${f.name}` : f.name;
+    try {
+      await sendFile(f, state.curPath, (loaded) => paint(sent + loaded));
+      ok++;
+    } catch (e) {
+      fail++;
+      failMsgs.push(f.name + (e && e.message ? '：' + e.message : ''));
+    }
+    sent += f.size;
+    paint(sent);
+  }
+  setTimeout(() => { if (card) card.classList.add('hidden'); }, 800);
+  if (bar) bar.style.width = '0%';
+  if (fail) {
+    toast(`上传完成：成功 ${ok}，失败 ${fail}（${failMsgs[0] || ''}${failMsgs.length > 1 ? ' 等' : ''}）`);
+  } else {
+    toast(`上传成功 ${ok} 个文件`);
+  }
+  loadList(state.curPath);
+}
 
 // 拖拽
 let dragDepth = 0;
@@ -904,77 +1135,96 @@ window.addEventListener('drop', (e) => {
   if (!m || m.classList.contains('hidden')) return;
   e.preventDefault(); dragDepth = 0;
   const dm = $('#drop-mask'); if (dm) dm.classList.add('hidden');
+  const items = e.dataTransfer.items;
+  if (items && items.length && items[0].webkitGetAsEntry) {
+    // 拖入目录：遍历 webkitGetAsEntry 树，把目录结构展平成带相对路径的文件列表
+    // （与「上传文件夹」同一管线，服务端仍只收普通 multipart）
+    const entries = Array.from(items).map(it => {
+      try { return it.webkitGetAsEntry && it.webkitGetAsEntry(); } catch (err) { return null; }
+    }).filter(Boolean);
+    if (entries.some(en => en.isDirectory)) {
+      const out = [];
+      (async () => {
+        for (const en of entries) await walkEntry(en, '', out);
+        if (!out.length) return toast('拖入的内容里没有可上传的文件');
+        uploadDropped(out);
+      })();
+      return;
+    }
+  }
   if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);
 });
-
-function uploadFiles(files) {
-  if (!files || !files.length) return;
-  const fd = new FormData();
-  Array.from(files).forEach(f => fd.append('files', f, f.name));
-  const card = $('#upload-progress');
-  if (card) card.classList.remove('hidden');
-  const pn = $('#progress-name');
-  if (pn) pn.textContent = files.length > 1 ? `上传 ${files.length} 个文件…` : files[0].name;
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/api/upload?path=' + encodeURIComponent(state.curPath));
-  xhr.upload.onprogress = (e) => {
-    if (!e.lengthComputable) return;
-    const pct = Math.round(e.loaded / e.total * 100);
-    const bar = $('#progress-bar'), pp = $('#progress-pct');
-    if (bar) bar.style.width = pct + '%';
-    if (pp) pp.textContent = pct + '%';
-  };
-  xhr.onload = () => {
-    setTimeout(() => { if (card) card.classList.add('hidden'); }, 800);
-    const bar = $('#progress-bar'); if (bar) bar.style.width = '0%';
-    try {
-      const r = JSON.parse(xhr.responseText);
-      if (xhr.status === 200) { toast(`上传成功 ${r.files.length} 个文件`); loadList(state.curPath); }
-      else toast(r.error || '上传失败');
-    } catch (e) { toast('上传失败：' + xhr.status); }
-  };
-  xhr.onerror = () => { if (card) card.classList.add('hidden'); toast('上传失败'); };
-  xhr.send(fd);
+// 递归展开拖拽条目为 { file, relPath }；relPath 含顶层名（与 webkitRelativePath 一致）
+function walkEntry(entry, prefix, out) {
+  return new Promise((resolve) => {
+    const rel = prefix ? prefix + '/' + entry.name : entry.name;
+    if (entry.isFile) {
+      entry.file(f => { out.push({ file: f, relPath: rel }); resolve(); }, resolve);
+      return;
+    }
+    if (!entry.isDirectory) return resolve();
+    const reader = entry.createReader();
+    const all = [];
+    const readBatch = () => reader.readEntries(async batch => {
+      if (!batch.length) {
+        for (const en of all) await walkEntry(en, rel, out);
+        resolve();
+        return;
+      }
+      all.push(...batch);
+      readBatch(); // readEntries 单次最多返回 100 条，必须读到空为止
+    }, resolve);
+    readBatch();
+  });
 }
 
 /* ---------------- 文件夹上传 ----------------
-   浏览器 webkitdirectory 递归选中整个文件夹，逐文件上传到对应子目录（后端自动建目录） */
+   浏览器 webkitdirectory 递归选中整个文件夹，逐文件上传到对应子目录（后端自动建目录），
+   大文件自动走分片断点续传（与普通上传同一 sendFile 管线） */
 on('#btn-upload-dir', 'click', () => { const f = $('#dir-input'); if (f) f.click(); });
 on('#dir-input', 'change', (e) => { uploadFolder(e.target.files); e.target.value = ''; });
-function uploadOne(file, dirPath) {
-  return new Promise((resolve) => {
-    const fd = new FormData();
-    fd.append('files', file, file.name);
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/upload?path=' + encodeURIComponent(dirPath));
-    xhr.onload = () => resolve(xhr.status === 200);
-    xhr.onerror = () => resolve(false);
-    xhr.send(fd);
-  });
-}
 async function uploadFolder(files) {
-  const arr = Array.from(files || []);
+  const arr = Array.from(files || []).map(f => ({
+    file: f, relPath: f.webkitRelativePath || f.name
+  }));
+  await uploadSequence(arr);
+}
+// 顺序上传带相对路径的文件列表（[{file, relPath}]，relPath 含目录部分），
+// 「上传文件夹」与「拖拽目录上传」共用；进度按累计字节推进
+async function uploadSequence(arr) {
   if (!arr.length) return;
+  const totalBytes = arr.reduce((s, it) => s + (it.file.size || 0), 0) || 1;
+  let sent = 0, done = 0, fail = 0;
   const card = $('#upload-progress');
   if (card) card.classList.remove('hidden');
   const bar = $('#progress-bar'), pp = $('#progress-pct'), pn = $('#progress-name');
-  let done = 0, fail = 0;
-  for (const f of arr) {
-    // webkitRelativePath 形如 "顶层文件夹/子目录/文件名"（含顶层文件夹名，保留以重建目录结构）
-    const rp = f.webkitRelativePath || f.name;
+  const paint = (n) => {
+    const pct = Math.min(100, Math.round(n / totalBytes * 100));
+    if (bar) bar.style.width = pct + '%';
+    if (pp) pp.textContent = pct + '%';
+  };
+  for (const it of arr) {
+    const f = it.file, rp = it.relPath || f.name;
+    // relPath 形如 "顶层文件夹/子目录/文件名"（含顶层文件夹名，保留以重建目录结构）
     const idx = rp.lastIndexOf('/');
     const sub = idx > 0 ? rp.slice(0, idx) : '';
     const target = (state.curPath ? state.curPath + '/' : '') + sub;
     if (pn) pn.textContent = `上传文件夹 ${done + fail + 1}/${arr.length}：${f.name}`;
-    try { (await uploadOne(f, target)) ? done++ : fail++; } catch (e) { fail++; }
-    const pct = Math.round((done + fail) / arr.length * 100);
-    if (bar) bar.style.width = pct + '%';
-    if (pp) pp.textContent = pct + '%';
+    try {
+      await sendFile(f, target, (loaded) => paint(sent + loaded));
+      done++;
+    } catch (e) { fail++; }
+    sent += f.size || 0;
+    paint(sent);
   }
   setTimeout(() => { if (card) card.classList.add('hidden'); }, 800);
   if (bar) bar.style.width = '0%';
   toast(`文件夹上传完成：成功 ${done}${fail ? `，失败 ${fail}` : ''}`);
   loadList(state.curPath);
+}
+// 拖拽目录的入口：walkEntry 展开结果直接进同一管线
+function uploadDropped(items) {
+  uploadSequence(items);
 }
 
 /* ---------------- 媒体预览（浏览器端渲染） ----------------
@@ -985,18 +1235,42 @@ function extKindOf(name) {
   if (IMG_EXT.includes(ext)) return 'img';
   if (VID_EXT.includes(ext)) return 'vid';
   if (AUD_EXT.includes(ext)) return 'aud';
+  if (TXT_EXT.includes(ext)) return 'txt';
   return '';
 }
-function openPreview(rel, name, size) {
+// 文本预览扩展名：源码/配置/日志等纯文本，浏览器端按文本渲染（截断上限见 TXT_PREVIEW_MAX）
+const TXT_EXT = ['TXT','MD','LOG','JSON','CSV','XML','YML','YAML','INI','CONF','CFG','TOML',
+  'SH','BASH','PY','JS','TS','CSS','HTML','HTM','GO','C','CPP','H','JAVA','SQL','BAT','PS1','ENV','SERVICE'];
+const TXT_PREVIEW_MAX = 2 * 1024 * 1024; // 超过 2MB 只取前 2MB，避免大日志撑爆浏览器
+
+async function openPreview(rel, name, size) {
   const kind = extKindOf(name);
-  const img = $('#preview-img'), vid = $('#preview-video'), aud = $('#preview-audio');
+  const img = $('#preview-img'), vid = $('#preview-video'), aud = $('#preview-audio'), txt = $('#preview-text');
   const m = $('#preview-modal');
-  if (!kind || !img || !vid || !aud || !m) return;
+  if (!kind || !img || !vid || !aud || !txt || !m) return;
   const url = '/api/download?path=' + encodeURIComponent(rel);
-  [img, vid, aud].forEach(el => el.classList.add('hidden'));
+  [img, vid, aud, txt].forEach(el => el.classList.add('hidden'));
   if (kind === 'img') { img.src = url; img.classList.remove('hidden'); }
   else if (kind === 'vid') { vid.src = url; vid.classList.remove('hidden'); }
-  else { aud.src = url; aud.classList.remove('hidden'); }
+  else if (kind === 'aud') { aud.src = url; aud.classList.remove('hidden'); }
+  else {
+    // 文本文件：直接走下载接口取原始字节，浏览器端解码渲染，服务端不做任何加工
+    txt.classList.remove('hidden');
+    txt.textContent = '加载中…';
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error('读取失败 ' + resp.status);
+      const buf = await resp.arrayBuffer();
+      const cut = Math.min(buf.byteLength, TXT_PREVIEW_MAX);
+      let text = new TextDecoder('utf-8', { fatal: false }).decode(buf.slice(0, cut));
+      if (buf.byteLength > TXT_PREVIEW_MAX) {
+        text += `\n\n…（文件过大，仅显示前 ${fmtSize(TXT_PREVIEW_MAX)}，共 ${fmtSize(buf.byteLength)}）`;
+      }
+      txt.textContent = text;
+    } catch (e) {
+      txt.textContent = '文本预览失败：' + e.message;
+    }
+  }
   const t = $('#preview-name'); if (t) t.textContent = name;
   const info = $('#preview-info'); if (info) info.textContent = size != null ? fmtSize(size) : '';
   const dl = $('#preview-dl'); if (dl) dl.href = url;
@@ -1006,7 +1280,7 @@ function closePreview() {
   const m = $('#preview-modal');
   if (!m || m.classList.contains('hidden')) return;
   m.classList.add('hidden');
-  const img = $('#preview-img'), vid = $('#preview-video'), aud = $('#preview-audio');
+  const img = $('#preview-img'), vid = $('#preview-video'), aud = $('#preview-audio'), txt = $('#preview-text');
   // 停止播放并释放媒体资源
   [vid, aud].forEach(el => {
     if (!el) return;
@@ -1015,6 +1289,7 @@ function closePreview() {
     try { el.load(); } catch (e) {}
   });
   if (img) img.removeAttribute('src');
+  if (txt) txt.textContent = '';
 }
 document.addEventListener('click', (e) => {
   const closer = e.target.closest ? e.target.closest('[data-close]') : null;
@@ -1032,6 +1307,12 @@ const segState = { expire: 86400, count: 0, scheme: 'auto' };
 $$('#seg-expire .seg-item').forEach(b => b.addEventListener('click', () => {
   $$('#seg-expire .seg-item').forEach(x => x.classList.remove('active'));
   b.classList.add('active'); segState.expire = Number(b.dataset.sec);
+  // 点了预设档位就退出「自定义」模式：否则勾选状态下自定义输入会静默覆盖
+  // 刚点选的档位（提交逻辑优先读自定义值），用户以为选了 7 天实际还是旧日期
+  const tg = $('#expire-custom-toggle');
+  if (tg) { tg.checked = false; }
+  const ec = $('#expire-custom');
+  if (ec) { ec.disabled = true; ec.value = ''; }
 }));
 $$('#seg-count .seg-item').forEach(b => b.addEventListener('click', () => {
   $$('#seg-count .seg-item').forEach(x => x.classList.remove('active'));
@@ -1046,27 +1327,61 @@ $$('#seg-mode .seg-item').forEach(b => b.addEventListener('click', () => {
   $$('#seg-mode .seg-item').forEach(x => x.classList.remove('active'));
   b.classList.add('active');
 }));
-on('#expire-custom-toggle', 'change', (e) => { const c = $('#expire-custom'); if (c) c.disabled = !e.target.checked; });
+on('#expire-custom-toggle', 'change', (e) => {
+  const c = $('#expire-custom');
+  if (c) { c.disabled = !e.target.checked; if (c.disabled) c.value = ''; }
+  if (e.target.checked) {
+    // 进入自定义模式时取消预设档位的高亮，视觉上二选一
+    $$('#seg-expire .seg-item').forEach(x => x.classList.remove('active'));
+  } else {
+    const chip = $('#seg-expire .seg-item.active') || $$('#seg-expire .seg-item')[2];
+    if (chip) chip.classList.add('active');
+  }
+});
+// 访问密码开关：默认收起，开关打开才可输入，减少无密码分享时的视觉噪音
+on('#pw-toggle', 'change', (e) => {
+  const inp = $('#share-password');
+  if (inp) { inp.disabled = !e.target.checked; if (inp.disabled) inp.value = ''; }
+});
 
 function openShare(rel, name, size) {
-  shareTarget = { path: rel, name, size };
+  shareTarget = { path: rel, name, size, created: null };
   $('#share-filename').textContent = name;
   $('#share-filesize').textContent = size == null ? '—' : fmtSize(size);
   $('#share-result').classList.add('hidden');
   $('#host-override').value = '';
-  $('#share-password').value = '';
+  const aliasInp = $('#share-alias');
+  if (aliasInp) aliasInp.value = '';
+  const hlTg = $('#share-hotlink');
+  if (hlTg) hlTg.checked = false;
+  const pwInp = $('#share-password');
+  if (pwInp) { pwInp.value = ''; pwInp.disabled = true; }
+  const pwTg = $('#pw-toggle');
+  if (pwTg) pwTg.checked = false;
+  const genBtn = $('#btn-gen');
+  if (genBtn) genBtn.textContent = '生成链接';
   $('#share-modal').classList.remove('hidden');
 }
-function buildUrl(token, schemeMode, hostOverride) {
+// buildUrl 别名优先：设置了 alias 的分享用 /s/<alias>（token 链接同样有效）
+function buildUrl(token, schemeMode, hostOverride, alias) {
   const curScheme = location.protocol.replace(':', '');
   const scheme = schemeMode === 'auto' ? curScheme : schemeMode;
   const host = (hostOverride || '').trim() || location.host;
-  return `${scheme}://${host}/s/${token}`;
+  return `${scheme}://${host}/s/${alias || token}`;
 }
 on('#btn-gen', 'click', async () => {
   if (!shareTarget) return;
+  // 同一文件重复点「生成链接」：先撤销上一次生成的链接再建新的，
+  // 否则每次点击都会留下一条有效分享记录，失效入口越积越多
+  if (shareTarget.created) {
+    const again = await askConfirm('重新生成', '该文件本次已生成过链接，将撤销旧链接并按当前设置生成新链接，继续？');
+    if (!again) return;
+    try { await api('/api/share?token=' + encodeURIComponent(shareTarget.created), { method: 'DELETE' }); } catch (e) {}
+    shareTarget.created = null;
+  }
   let expireSeconds = segState.expire;
-  if ($('#expire-custom-toggle').checked) {
+  const customToggle = $('#expire-custom-toggle');
+  if (customToggle && customToggle.checked) {
     const v = $('#expire-custom').value;
     if (!v) return toast('请选择到期时间');
     const t = new Date(v).getTime();
@@ -1076,18 +1391,23 @@ on('#btn-gen', 'click', async () => {
   const customCount = $('#count-custom').value.trim();
   const maxDownloads = customCount !== '' ? Math.max(0, parseInt(customCount, 10) || 0) : segState.count;
   const modeBtn = $('#seg-mode .seg-item.active');
+  const pwInp = $('#share-password');
+  const aliasInp = $('#share-alias'), hlTg = $('#share-hotlink');
   try {
     const r = await api('/api/share', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         path: shareTarget.path, expireSeconds, maxDownloads,
         scheme: segState.scheme, host: $('#host-override').value.trim(),
-        password: $('#share-password').value.trim(),
-        mode: (modeBtn && modeBtn.dataset.mode) || 'direct'
+        password: pwInp && !pwInp.disabled ? pwInp.value.trim() : '',
+        mode: (modeBtn && modeBtn.dataset.mode) || 'direct',
+        alias: aliasInp ? aliasInp.value.trim() : '',
+        hotlink: hlTg ? hlTg.checked : false
       })
     });
     if (!r) return;
-    const url = buildUrl(r.share.token, segState.scheme, $('#host-override').value.trim());
+    shareTarget.created = r.share.token;
+    const url = buildUrl(r.share.token, segState.scheme, $('#host-override').value.trim(), r.share.alias);
     $('#share-url').value = url;
     // 二维码：纯前端生成，扫码即可访问分享链接
     const qr = $('#share-qr');
@@ -1102,11 +1422,20 @@ on('#btn-gen', 'click', async () => {
       : `<span class="tag green">不限次数</span>`;
     const pwTag = r.share.hasPw ? `<span class="tag orange">🔒 密码保护</span>` : '';
     const modeTag = (r.share.mode === 'page') ? `<span class="tag">确认页模式</span>` : `<span class="tag green">直链模式</span>`;
-    $('#share-meta').innerHTML = leftTag + cntTag + pwTag + modeTag +
+    const aliasTag = r.share.alias ? `<span class="tag purple">别名 /s/${esc(r.share.alias)}</span>` : '';
+    const hlTag = r.share.hotlink ? `<span class="tag">防盗链已开启</span>` : '';
+    $('#share-meta').innerHTML = leftTag + cntTag + pwTag + modeTag + aliasTag + hlTag +
       `<span class="tag">${esc(url.split('://')[0].toUpperCase())} 协议</span>` +
       `<br>到期时间：${fmtTime(r.share.expiresAt)}` +
       (r.share.hasPw ? `<br>提示：链接本身不含密码，请把密码单独告知对方` : '');
-    $('#share-result').classList.remove('hidden');
+    const result = $('#share-result');
+    result.classList.remove('hidden');
+    // 结果区已置顶，正常无需滚动；小屏/缩放场景兜底滚动定位一次
+    try { result.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } catch (e) {}
+    result.classList.remove('result-flash');
+    void result.offsetWidth; // 重启动画
+    result.classList.add('result-flash');
+    $('#btn-gen').textContent = '重新生成';
     refreshShares();
   } catch (e) { toast(e.message); }
 });
@@ -1114,6 +1443,78 @@ on('#btn-copy', 'click', async () => {
   const ok = await copyText($('#share-url').value);
   toast(ok ? '链接已复制' : '复制失败，请手动复制');
 });
+
+/* ---------------- 最近 30 天下载统计图（canvas 客户端绘制） ---------------- */
+let statsDays = null;
+async function loadStats() {
+  const cv = $('#stats-chart');
+  if (!cv) return;
+  try {
+    const d = await api('/api/stats');
+    if (!d) return;
+    statsDays = d.days || [];
+    drawStatsChart();
+    const totals = statsDays.reduce((a, x) => ({ dl: a.dl + (x.downloads || 0), fail: a.fail + (x.fails || 0), pv: a.pv + (x.previews || 0) }), { dl: 0, fail: 0, pv: 0 });
+    const sm = $('#stats-summary');
+    if (sm) sm.textContent = `下载 ${totals.dl} 次 · 预览 ${totals.pv} 次 · 失败 ${totals.fail} 次`;
+  } catch (e) { /* 统计加载失败不打扰主流程 */ }
+}
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#888';
+}
+function drawStatsChart() {
+  const cv = $('#stats-chart');
+  if (!cv || !statsDays) return;
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth || cv.parentElement.clientWidth || 600;
+  const H = 150;
+  cv.width = W * dpr; cv.height = H * dpr;
+  cv.style.height = H + 'px';
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const padL = 8, padR = 8, padT = 10, padB = 22;
+  const n = statsDays.length || 1;
+  const slot = (W - padL - padR) / n;
+  const barW = Math.max(2, Math.min(14, slot * 0.55));
+  const innerH = H - padT - padB;
+  const maxV = Math.max(1, ...statsDays.map(d => Math.max(d.downloads || 0, d.fails || 0)));
+  const cBlue = cssVar('--primary'), cRed = cssVar('--red'), cDim = cssVar('--t3'), cLine = cssVar('--line');
+  // 网格线（1/2、满值两条）
+  ctx.strokeStyle = cLine; ctx.lineWidth = 1;
+  [0.5, 1].forEach(f => {
+    const y = Math.round(padT + innerH * (1 - f)) + .5;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+  });
+  statsDays.forEach((d, i) => {
+    const cx = padL + slot * i + slot / 2;
+    const dh = (d.downloads || 0) / maxV * innerH;
+    if (dh > 0) {
+      ctx.fillStyle = cBlue;
+      // 下载与失败并排：失败画在右侧细条
+      ctx.fillRect(cx - barW - 1, padT + innerH - dh, barW, dh);
+    }
+    const fh = (d.fails || 0) / maxV * innerH;
+    if (fh > 0) {
+      ctx.fillStyle = cRed;
+      ctx.fillRect(cx + 1, padT + innerH - fh, Math.max(2, barW * 0.5), fh);
+    }
+    // 每 5 天一个日期刻度（Go JSON 字段为小写 date）
+    if (i % 5 === 0 || i === n - 1) {
+      ctx.fillStyle = cDim;
+      ctx.font = '10px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(d.date, cx, H - 8);
+    }
+  });
+  if (!statsDays.some(d => (d.downloads || 0) + (d.fails || 0) > 0)) {
+    ctx.fillStyle = cDim;
+    ctx.font = '12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('最近 30 天还没有分享访问记录', W / 2, H / 2);
+  }
+}
+window.addEventListener('resize', () => { if (statsDays) drawStatsChart(); });
 
 /* ---------------- 分享管理（右侧视图） ---------------- */
 let allShares = [];
@@ -1181,26 +1582,30 @@ function renderShares() {
     return;
   }
   list.forEach(s => {
-    const url = buildUrl(s.token, s.scheme === 'auto' ? 'auto' : s.scheme, s.host);
+    const url = buildUrl(s.token, s.scheme === 'auto' ? 'auto' : s.scheme, s.host, s.alias);
     const el = document.createElement('div');
     el.className = 'mgr-item';
     el.dataset.token = s.token;
     const cnt = s.maxDownloads > 0
       ? `<span class="tag">${s.downloads}/${s.maxDownloads} 次</span>`
       : `<span class="tag green">不限次 (已下载 ${s.downloads})</span>`;
+    const aliasTag = s.alias ? `<span class="tag purple">别名 /s/${esc(s.alias)}</span>` : '';
+    const hlTag = s.hotlink ? `<span class="tag">防盗链</span>` : '';
     el.innerHTML = `
       <input type="checkbox" class="row-check share-check" data-token="${esc(s.token)}" title="选择此分享">
       <div class="fi">${svgFile}</div>
       <div class="mgr-main">
         <div class="mgr-name">${esc(s.name)}</div>
-        <div class="mgr-meta">${shareStatusTag(s)}${cnt}${sharePwTag(s)}${shareModeTag(s)}<span class="tag">${fmtSize(s.size)}</span><span class="tag">${fmtTime(s.createdAt)}</span></div>
+        <div class="mgr-meta">${shareStatusTag(s)}${cnt}${sharePwTag(s)}${shareModeTag(s)}${aliasTag}${hlTag}<span class="tag">${fmtSize(s.size)}</span><span class="tag">${fmtTime(s.createdAt)}</span></div>
         <div class="mgr-meta"><code>${esc(url)}</code></div>
         <div class="share-edit hidden"></div>
         <div class="share-log hidden"></div>
       </div>`;
-    // 点击条目主体直接展开编辑（按钮/链接/复制除外）
+    // 点击条目主体直接展开编辑（按钮/链接/复制/编辑面板/日志面板除外）。
+    // 注意 .share-edit 里的 <select> 与 .share-log 的文本都不在 a/button/input
+    // 选择器内，若不整体排除，点击下拉框会把刚展开的编辑面板又收起来
     el.querySelector('.mgr-main').addEventListener('click', (e) => {
-      if (e.target.closest('a, button, input, [data-copy-pw]')) return;
+      if (e.target.closest('a, button, input, select, [data-copy-pw], .share-edit, .share-log')) return;
       toggleShareEdit(s, el);
     });
     // 密码标签点击复制：data-copy-pw 属性此前只被 closest 排除逻辑引用，
@@ -1215,6 +1620,9 @@ function renderShares() {
     right.className = 'right-col';
     right.appendChild(mkAction('复制链接', 'btn-primary mini', async () => {
       toast(await copyText(url) ? '链接已复制' : '复制失败');
+    }));
+    right.appendChild(mkAction('打开', 'btn-soft mini', () => {
+      window.open(url, '_blank', 'noopener');
     }));
     right.appendChild(mkAction('编辑', 'btn-soft mini', () => toggleShareEdit(s, el)));
     right.appendChild(mkAction('日志', 'btn-soft mini', () => toggleShareLog(s.token, s.name, el)));
@@ -1255,6 +1663,12 @@ function toggleShareEdit(s, itemEl) {
     <div class="edit-row"><span class="edit-label">访问密码</span>
       <input type="text" class="input-sm" id="se-pw-${s.token}" value="${esc(s.password || '')}" placeholder="留空 = 清除密码保护">
     </div>
+    <div class="edit-row"><span class="edit-label">链接别名</span>
+      <input type="text" class="input-sm" id="se-alias-${s.token}" value="${esc(s.alias || '')}" placeholder="留空 = 不用别名（中英文/数字/-/_）">
+    </div>
+    <div class="edit-row"><span class="edit-label">防盗链</span>
+      <label class="switch"><input type="checkbox" id="se-hl-${s.token}"${s.hotlink ? ' checked' : ''}><span>拒绝其他网站的页面引用</span></label>
+    </div>
     <div class="edit-row"><span class="edit-label">访问方式</span>
       <span class="seg" id="se-mode-${s.token}">
         <button type="button" class="seg-item${s.mode !== 'page' ? ' active' : ''}" data-mode="direct">直链下载</button>
@@ -1284,13 +1698,22 @@ function toggleShareEdit(s, itemEl) {
       expiresAt = Date.now() + Number(sel.value) * 1000;
     }
     const modeBtn = pane.querySelector(`#se-mode-${s.token} .seg-item.active`);
+    const aliasVal = (pane.querySelector(`#se-alias-${s.token}`).value || '').trim();
+    if (aliasVal) {
+      // 前端先做与后端一致的校验（中英文/数字/中划线/下划线，1~40 字符），省一次必然失败的往返
+      if (!/^[\w\u4e00-\u9fa5-]{1,40}$/.test(aliasVal)) {
+        return toast('别名不合法：仅限中英文、数字、中划线、下划线，1~40 字符');
+      }
+    }
     try {
       await api('/api/share/update', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           token: s.token, expiresAt,
           password: pane.querySelector(`#se-pw-${s.token}`).value.trim(),
-          mode: (modeBtn && modeBtn.dataset.mode) || 'direct'
+          mode: (modeBtn && modeBtn.dataset.mode) || 'direct',
+          alias: aliasVal,
+          hotlink: pane.querySelector(`#se-hl-${s.token}`).checked
         })
       });
       toast('分享已更新');
@@ -1711,6 +2134,7 @@ on('#pw-save', 'click', async () => {
 });
 
 /* ---------------- 回收站 ---------------- */
+const trashSel = new Set(); // 勾选的回收站条目名
 async function loadTrash() {
   const box = $('#trash-list');
   if (!box) return;
@@ -1719,6 +2143,8 @@ async function loadTrash() {
   try { d = await api('/api/trash'); } catch (e) { box.innerHTML = `<div class="mgr-empty">${esc(e.message)}</div>`; return; }
   if (!d) return;
   const days = $('#trash-days'); if (days) days.textContent = d.retentionDays || '—';
+  trashSel.clear();
+  updateTrashBatchUI();
   if (!d.items || !d.items.length) {
     box.innerHTML = '<div class="mgr-empty">回收站是空的<br>删除的文件会先移到这里，保留期内可随时恢复</div>';
     return;
@@ -1728,11 +2154,17 @@ async function loadTrash() {
     const el = document.createElement('div');
     el.className = 'trash-item';
     el.innerHTML = `
+      <input type="checkbox" class="row-check trash-check" data-name="${esc(it.name)}" title="选择此条目">
       <div class="fi ${it.isDir ? 'dir' : ''}">${it.isDir ? svgDir : svgFile}</div>
       <div class="trash-main">
         <div class="mgr-name">${esc((it.orig || it.name).split('/').pop())}</div>
         <div class="trash-orig">原路径：${esc(it.orig)} · 删除于 ${fmtTime(it.deleted)} · ${it.isDir ? '文件夹' : fmtSize(it.size)}</div>
       </div>`;
+    el.querySelector('.trash-check').addEventListener('change', (e) => {
+      if (e.target.checked) trashSel.add(it.name);
+      else trashSel.delete(it.name);
+      updateTrashBatchUI();
+    });
     const right = document.createElement('div');
     right.className = 'right-col';
     right.appendChild(mkAction('恢复', 'btn-primary mini', async () => {
@@ -1759,6 +2191,57 @@ async function loadTrash() {
     box.appendChild(el);
   });
 }
+function updateTrashBatchUI() {
+  const btnR = $('#trash-batch-restore'), btnP = $('#trash-batch-purge'), all = $('#trash-check-all');
+  if (btnR) btnR.disabled = trashSel.size === 0;
+  if (btnP) btnP.disabled = trashSel.size === 0;
+  if (all) {
+    const boxes = $$('#trash-list .trash-check');
+    all.checked = boxes.length > 0 && trashSel.size === boxes.length;
+    all.indeterminate = trashSel.size > 0 && trashSel.size < boxes.length;
+  }
+}
+on('#trash-check-all', 'change', () => {
+  const on_ = $('#trash-check-all').checked;
+  $$('#trash-list .trash-check').forEach(c => {
+    c.checked = on_;
+    if (on_) trashSel.add(c.dataset.name); else trashSel.delete(c.dataset.name);
+  });
+  updateTrashBatchUI();
+});
+on('#trash-batch-restore', 'click', async () => {
+  const names = Array.from(trashSel);
+  if (!names.length) return;
+  let ok = 0, fail = 0;
+  for (const n of names) {
+    try {
+      await api('/api/trash/restore', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: n })
+      });
+      ok++;
+    } catch (e) { fail++; }
+  }
+  toast(`恢复完成：成功 ${ok}${fail ? `，失败 ${fail}` : ''}`);
+  loadTrash(); loadList(state.curPath);
+});
+on('#trash-batch-purge', 'click', async () => {
+  const names = Array.from(trashSel);
+  if (!names.length) return;
+  if (!(await askConfirm('批量彻底删除', `彻底删除选中的 ${names.length} 项？此操作不可恢复。`))) return;
+  let ok = 0, fail = 0;
+  for (const n of names) {
+    try {
+      await api('/api/trash/purge', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: n })
+      });
+      ok++;
+    } catch (e) { fail++; }
+  }
+  toast(`已彻底删除 ${ok} 项${fail ? `，失败 ${fail} 项` : ''}`);
+  loadTrash();
+});
 on('#trash-clear', 'click', async () => {
   if (!(await askConfirm('清空回收站', '彻底删除回收站内的全部内容？此操作不可恢复。'))) return;
   try {

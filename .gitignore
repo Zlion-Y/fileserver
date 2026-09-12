@@ -1,4 +1,3 @@
-
 data/
 dist/
 dist-go/
@@ -6,3 +5,4 @@ files/
 .env
 *.log
 .DS_Store
+*.exe

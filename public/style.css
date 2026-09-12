@@ -272,13 +272,23 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; color:
 .modal-card.wide { width: min(720px, 96vw); }
 .modal-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 12px; }
 .modal-head h2 { font-size: 16px; font-weight: 600; margin: 0; }
-.modal-body { padding: 4px 20px 8px; overflow-y: auto; }
+.modal-body { padding: 4px 20px 8px; overflow-y: auto; overscroll-behavior: contain; }
 .modal-foot { display: flex; justify-content: flex-end; gap: 10px; padding: 14px 20px; border-top: 1px solid var(--line); }
 .group { margin: 14px 0; }
 .group-title { font-size: 12.5px; color: var(--t2); margin-bottom: 8px; font-weight: 500; }
 .group .hint { font-size: 12px; color: var(--t3); margin: 7px 0 0; }
 .group .row { display: flex; align-items: center; gap: 10px; margin-top: 9px; }
+/* 宽屏下「有效期 | 下载次数」「访问方式 | 链接协议」双列排布，缩短弹窗滚动长度 */
+.group-cols { display: grid; grid-template-columns: 1fr; gap: 0 22px; }
+@media (min-width: 861px) {
+  #share-modal .modal-card { width: min(640px, 96vw); }
+  #share-modal .group-cols { grid-template-columns: 1fr 1fr; }
+  #share-modal .group-cols .group { margin-top: 14px; }
+}
 .switch { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--t2); cursor: pointer; }
+.switch input { width: 15px; height: 15px; accent-color: var(--primary); cursor: pointer; }
+#share-modal .row .input-sm { flex: 1; min-width: 0; }
+#share-modal .group > .input-sm { margin-top: 9px; }
 .seg { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
 .seg-item {
   height: 32px; padding: 0 14px; border-radius: 8px; border: 1px solid var(--line);
@@ -296,6 +306,12 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; color:
 .fp-name { font-size: 14px; font-weight: 600; word-break: break-all; }
 .fp-size { font-size: 12px; color: var(--t3); margin-top: 2px; }
 .result { border: 1px solid var(--line); border-radius: 10px; padding: 13px 14px; margin: 12px 0 6px; }
+/* 生成链接成功后的短暂描边提示（结果区已置顶，动画代替滚动定位） */
+.result-flash { animation: resultFlash 1.4s ease; }
+@keyframes resultFlash {
+  0% { box-shadow: 0 0 0 3px rgba(37,99,235,.4); border-color: var(--primary); }
+  100% { box-shadow: 0 0 0 0 rgba(37,99,235,0); }
+}
 .result-label { font-size: 12px; color: var(--t3); margin-bottom: 8px; }
 .result-row { display: flex; gap: 8px; }
 .input-url {
@@ -562,6 +578,13 @@ html[data-theme="dark"] .preview-body { background: rgba(0,0,0,.3); }
 .preview-body img { max-width: 100%; max-height: 62vh; object-fit: contain; border-radius: 8px; }
 .preview-body video { max-width: 100%; max-height: 62vh; border-radius: 8px; background: #000; }
 .preview-body audio { width: 100%; }
+/* 文本预览：浏览器端按纯文本渲染（textContent，天然免疫 HTML 注入） */
+#preview-text {
+  width: 100%; max-height: 62vh; overflow: auto; margin: 0; padding: 14px 16px;
+  font-family: ui-monospace, Consolas, "Courier New", monospace; font-size: 12.5px;
+  line-height: 1.65; color: var(--t1); white-space: pre-wrap; word-break: break-all;
+  text-align: left; align-self: stretch; box-sizing: border-box;
+}
 .preview-info { margin-right: auto; font-size: 12.5px; color: var(--t3); }
 
 /* ---------- 分享二维码 ---------- */
@@ -573,6 +596,51 @@ html[data-theme="dark"] .preview-body { background: rgba(0,0,0,.3); }
 .trash-item:last-child { border-bottom: 0; }
 .trash-main { flex: 1; min-width: 0; }
 .trash-orig { font-size: 11.5px; color: var(--t3); margin-top: 4px; word-break: break-all; }
+
+/* ---------- 相册视图 ---------- */
+.gallery {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(136px, 1fr));
+  gap: 12px; padding: 16px;
+}
+.g-tile {
+  border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+  background: var(--surface-2); cursor: pointer; min-width: 0;
+  transition: border-color .12s, transform .12s;
+}
+.g-tile:hover { border-color: var(--primary); transform: translateY(-1px); }
+.g-thumb {
+  aspect-ratio: 1; width: 100%; display: flex; align-items: center; justify-content: center;
+  background: var(--bg); overflow: hidden;
+}
+.g-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.g-thumb .fi { width: 38px; height: 38px; }
+.g-thumb .fi svg { width: 20px; height: 20px; }
+.g-name {
+  padding: 6px 8px; font-size: 11.5px; color: var(--t2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.g-more {
+  grid-column: 1 / -1; text-align: center; padding: 12px; font-size: 12.5px;
+  color: var(--t3); cursor: pointer;
+}
+.g-more:hover { color: var(--primary); }
+
+/* ---------- 下载统计图 ---------- */
+.stats-card { margin-top: 18px; }
+.stats-card .sec-title { margin: 0; }
+#stats-chart { display: block; width: 100%; padding: 6px 12px 0; box-sizing: border-box; }
+.stats-legend {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 8px 16px 12px; font-size: 12px; color: var(--t2);
+}
+.stats-legend .dot { display: inline-block; width: 9px; height: 9px; border-radius: 3px; margin-right: 5px; }
+.dot-blue { background: var(--primary); }
+.dot-red { background: var(--red); }
+.stats-note { margin-left: auto; color: var(--t3); font-size: 11.5px; }
+.hotlink-switch { margin-top: 9px; }
+
+/* ---------- 回收站勾选 ---------- */
+.trash-item .trash-check { flex-shrink: 0; }
 
 /* ---------- 主题切换按钮 ---------- */
 #btn-theme svg { width: 17px; height: 17px; flex-shrink: 0; }
@@ -614,10 +682,16 @@ html[data-theme="dark"] .preview-body { background: rgba(0,0,0,.3); }
   .page { padding: 14px 12px calc(30px + env(safe-area-inset-bottom)); }
   .topbar { padding: 10px 12px; }
   /* 磁盘胶囊 flex-shrink:0 且内容宽 ~270px，是把页面撑出横向滚动的主因：
-     手机上只留 图标 + 百分比 + 进度条，并允许收缩 */
+     手机上只留 图标 + 百分比 + 进度条，并允许收缩。
+     搜索框以占位文本为弹性基准（~250px）会把胶囊挤压到内容宽度以下，
+     内部进度条再溢出容器 → 页面出现横向滚动。这里让输入框以较小基准参与收缩、
+     进度条可缩到 28px，保证 320px 窄屏也不溢出 */
   #disk-pill { flex-shrink: 1; min-width: 0; padding: 0 10px; gap: 6px; }
   #disk-pill .pill-label, #disk-pill .pill-free { display: none; }
-  #disk-pill .pill-bar { width: 44px; flex-shrink: 0; }
+  #disk-pill .pill-bar { width: 44px; min-width: 28px; flex-shrink: 1; }
+  #disk-pill .pill-label + * { flex-shrink: 0; }
+  .search-wrap { min-width: 0; }
+  .search-wrap input { flex: 1 1 120px; min-width: 0; }
   /* 顶部标签栏改为换行：整条需要 ~970px，横向滚动会让「深色模式/退出登录」
      永远不可见；换行后两行放得下全部入口 */
   .sidebar {
@@ -726,4 +800,61 @@ html[data-theme="dark"] .preview-body { background: rgba(0,0,0,.3); }
   .empty p { word-break: keep-all; overflow-wrap: anywhere; }
   /* 回收站页头工具行：按钮换行排列不溢出 */
   .tidy-hours-row { row-gap: 8px; }
+
+  /* ---------- 移动端触控与布局增强 ---------- */
+  /* 清除安卓点按高亮块，按钮反馈交给 :active 样式 */
+  * { -webkit-tap-highlight-color: transparent; }
+  button, .seg-item, .chip, .nav-item, .tag-link { touch-action: manipulation; user-select: none; }
+  .btn:active { filter: brightness(.92); }
+
+  /* 批量操作栏贴底悬浮：勾选文件后滚动到列表任何位置都能操作，
+     不再需要滚回列表顶部；底部留出安全区 */
+  .batch-bar {
+    position: fixed; left: 10px; right: 10px; bottom: calc(10px + env(safe-area-inset-bottom));
+    z-index: 45; margin: 0;
+    box-shadow: 0 8px 26px rgba(15,23,42,.22); backdrop-filter: blur(6px);
+    padding: 10px 12px;
+  }
+  /* 悬浮批量栏可能盖住列表末行：文件视图底部预留空间 */
+  #view-files { padding-bottom: 64px; }
+
+  /* 弹窗改为底部抽屉（bottom-sheet）：拇指可达，贴底上滑的移动端习惯 */
+  .modal {
+    align-items: flex-end; padding: 0;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .modal-card {
+    width: 100%; max-width: 100%; max-height: 88dvh;
+    border-radius: 18px 18px 0 0;
+    box-shadow: 0 -12px 50px rgba(15,23,42,.3);
+    animation: sheetUp .22s ease;
+  }
+  @keyframes sheetUp {
+    from { transform: translateY(40px); opacity: .6; }
+    to { transform: translateY(0); opacity: 1; }
+  }
+  .modal-foot { padding-bottom: calc(14px + env(safe-area-inset-bottom)); flex-wrap: wrap; }
+  .modal-foot .btn { flex: 1; min-width: 120px; }
+
+  /* 分享管理 / 回收站 / 会话列表条目：右侧竖排按钮组改为换行横排，
+     竖排会占掉一半宽度把文件名挤成两三个字 */
+  .mgr-item, .trash-item, .sess-item { flex-wrap: wrap; row-gap: 8px; }
+  .mgr-item .right-col, .trash-item .right-col, .sess-item .right-col {
+    flex-direction: row; flex-wrap: wrap; width: 100%;
+    gap: 8px; padding-top: 8px; border-top: 1px dashed var(--line);
+  }
+  .mgr-item .right-col .btn, .trash-item .right-col .btn, .sess-item .right-col .btn { flex: 1; min-width: 72px; }
+
+  /* 媒体/文本预览：占满弹窗，深色底衬托图片视频 */
+  #preview-modal { padding: 0; padding-bottom: env(safe-area-inset-bottom); }
+  .preview-card { max-height: 92dvh; }
+  .preview-body { min-height: 46dvh; border-radius: 0; }
+  .preview-body img, .preview-body video { max-height: 52dvh; }
+  #preview-text { max-height: 56dvh; }
+
+  /* 相册网格：小屏三列起步 */
+  .gallery { grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 8px; padding: 10px; }
+  .g-name { font-size: 11px; padding: 5px 6px; }
+  #stats-chart { padding: 2px 6px 0; }
+  .stats-note { width: 100%; margin-left: 0; }
 }

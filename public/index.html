@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>FileHub - 文件服务</title>
 <link rel="stylesheet" href="/style.css">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon.svg">
+<meta name="theme-color" content="#2563EB">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📁</text></svg>">
 <script>
 /* 首帧前确定主题：本地记忆优先，否则跟随系统。必须在 CSS 渲染前执行，避免暗色闪白 */
@@ -169,10 +172,11 @@
       </div>
 
       <div class="card">
-        <div class="table-top">
+          <div class="table-top">
           <span id="count-info" class="count-info"></span>
           <div class="table-top-right">
             <button id="search-clear" class="btn btn-soft mini hidden">返回目录</button>
+            <button id="btn-gallery" class="btn btn-soft mini" title="图片文件夹可切换为缩略图相册（浏览器端懒加载）">相册</button>
             <select id="sort-select" class="input-sm">
               <option value="time-desc">排序：修改时间 ↓</option>
               <option value="time-asc">排序：修改时间 ↑</option>
@@ -205,6 +209,7 @@
             <tbody id="list"></tbody>
           </table>
         </div>
+        <div id="gallery" class="gallery hidden"></div>
         <div id="empty" class="empty hidden">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
           <p>这个文件夹是空的，把文件拖进来即可上传</p>
@@ -221,6 +226,18 @@
       <div id="view-shares" class="view hidden">
         <div class="page-head">
           <h1>分享管理</h1>
+        </div>
+        <div class="card stats-card">
+          <div class="table-top">
+            <span class="sec-title">最近 30 天下载动态</span>
+            <span id="stats-summary" class="count-info"></span>
+          </div>
+          <canvas id="stats-chart" height="150"></canvas>
+          <div class="stats-legend">
+            <span><i class="dot dot-blue"></i>下载成功</span>
+            <span><i class="dot dot-red"></i>访问失败</span>
+            <span class="stats-note">基于各分享保留的最近 50 条访问日志</span>
+          </div>
         </div>
         <div class="card">
           <div class="table-top">
@@ -333,7 +350,11 @@
             <div class="tidy-hours-row" style="margin:0">
               <span>删除的文件会先进入回收站，超过保留期后自动清理。当前保留：</span>
               <span class="upd-val"><span id="trash-days">7</span> 天</span>
-              <button id="trash-clear" class="btn btn-soft mini btn-danger" style="margin-left:auto">清空回收站</button>
+              <span style="margin-left:auto"></span>
+              <label class="switch"><input type="checkbox" id="trash-check-all" class="row-check"><span>全选</span></label>
+              <button id="trash-batch-restore" class="btn btn-soft mini" disabled>恢复选中</button>
+              <button id="trash-batch-purge" class="btn btn-soft mini btn-danger" disabled>彻底删除选中</button>
+              <button id="trash-clear" class="btn btn-soft mini btn-danger">清空回收站</button>
             </div>
           </div>
           <div id="trash-list" class="mgr-list view-list" style="max-height:none"><div class="mgr-empty">加载中…</div></div>
@@ -380,38 +401,54 @@
         <div><div id="share-filename" class="fp-name">—</div><div id="share-filesize" class="fp-size">—</div></div>
       </div>
 
-      <div class="group">
-        <div class="group-title">有效期</div>
-        <div class="seg" id="seg-expire">
-          <button class="seg-item" data-sec="3600">1 小时</button>
-          <button class="seg-item" data-sec="21600">6 小时</button>
-          <button class="seg-item active" data-sec="86400">1 天</button>
-          <button class="seg-item" data-sec="604800">7 天</button>
-          <button class="seg-item" data-sec="2592000">30 天</button>
-          <button class="seg-item" data-sec="0">永久</button>
+      <!-- 生成结果紧跟文件信息置顶：点击「生成链接」后无需滚动即可看到链接与二维码 -->
+      <div id="share-result" class="result hidden">
+        <div class="result-label">分享链接</div>
+        <div class="result-row">
+          <input id="share-url" class="input-url" readonly>
+          <button id="btn-copy" class="btn btn-primary">复制</button>
         </div>
-        <div class="row">
-          <label class="switch">
-            <input type="checkbox" id="expire-custom-toggle"><span>自定义到期时间</span>
-          </label>
+        <div class="result-qr">
+          <canvas id="share-qr" width="10" height="10" title="扫码访问分享链接"></canvas>
+        </div>
+        <div id="share-meta" class="result-meta"></div>
+      </div>
+
+      <div class="group-cols">
+        <div class="group">
+          <div class="group-title">有效期</div>
+          <div class="seg" id="seg-expire">
+            <button class="seg-item" data-sec="3600">1 小时</button>
+            <button class="seg-item" data-sec="21600">6 小时</button>
+            <button class="seg-item active" data-sec="86400">1 天</button>
+            <button class="seg-item" data-sec="604800">7 天</button>
+            <button class="seg-item" data-sec="2592000">30 天</button>
+            <button class="seg-item" data-sec="0">永久</button>
+          </div>
+          <div class="row">
+            <label class="switch">
+              <input type="checkbox" id="expire-custom-toggle"><span>自定义到期时间</span>
+            </label>
+          </div>
           <input type="datetime-local" id="expire-custom" class="input-sm" disabled>
         </div>
-      </div>
 
-      <div class="group">
-        <div class="group-title">下载次数</div>
-        <div class="seg" id="seg-count">
-          <button class="seg-item" data-count="1">1 次</button>
-          <button class="seg-item" data-count="5">5 次</button>
-          <button class="seg-item" data-count="20">20 次</button>
-          <button class="seg-item active" data-count="0">不限</button>
-          <input type="number" id="count-custom" class="input-sm num" min="0" placeholder="自定义">
+        <div class="group">
+          <div class="group-title">下载次数</div>
+          <div class="seg" id="seg-count">
+            <button class="seg-item" data-count="1">1 次</button>
+            <button class="seg-item" data-count="5">5 次</button>
+            <button class="seg-item" data-count="20">20 次</button>
+            <button class="seg-item active" data-count="0">不限</button>
+            <input type="number" id="count-custom" class="input-sm num" min="0" placeholder="自定义">
+          </div>
+          <div class="row">
+            <label class="switch">
+              <input type="checkbox" id="pw-toggle"><span>访问密码</span>
+            </label>
+            <input type="text" id="share-password" class="input-sm" placeholder="留空 = 无需密码" autocomplete="off" disabled>
+          </div>
         </div>
-      </div>
-
-      <div class="group">
-        <div class="group-title">访问密码（可选）</div>
-        <input type="text" id="share-password" class="input-sm" placeholder="留空 = 无需密码" autocomplete="off">
       </div>
 
       <div class="group">
@@ -424,6 +461,14 @@
       </div>
 
       <div class="group">
+        <div class="group-title">链接别名与防盗链（可选）</div>
+        <input type="text" id="share-alias" class="input-sm" placeholder="自定义链接尾段，如 发布会-materials（中英文/数字/-/_）" autocomplete="off">
+        <label class="switch hotlink-switch">
+          <input type="checkbox" id="share-hotlink"><span>防盗链：拒绝其他网站页面引用此链接</span>
+        </label>
+      </div>
+
+      <div class="group">
         <div class="group-title">链接协议（无 HTTPS 环境 / 路由器下载）</div>
         <div class="seg" id="seg-scheme">
           <button class="seg-item active" data-scheme="auto">自动识别</button>
@@ -431,18 +476,6 @@
           <button class="seg-item" data-scheme="https">强制 HTTPS</button>
         </div>
         <input type="text" id="host-override" class="input-sm" placeholder="可选：自定义域名/IP:端口（留空则用当前前台域名）">
-      </div>
-
-      <div id="share-result" class="result hidden">
-        <div class="result-label">分享链接</div>
-        <div class="result-row">
-          <input id="share-url" class="input-url" readonly>
-          <button id="btn-copy" class="btn btn-primary">复制</button>
-        </div>
-        <div class="result-qr">
-          <canvas id="share-qr" width="10" height="10" title="扫码访问分享链接"></canvas>
-        </div>
-        <div id="share-meta" class="result-meta"></div>
       </div>
     </div>
     <div class="modal-foot">
@@ -510,6 +543,7 @@
       <img id="preview-img" class="hidden" alt="图片预览">
       <video id="preview-video" class="hidden" controls playsinline></video>
       <audio id="preview-audio" class="hidden" controls></audio>
+      <pre id="preview-text" class="hidden"></pre>
     </div>
     <div class="modal-foot">
       <span id="preview-info" class="preview-info"></span>

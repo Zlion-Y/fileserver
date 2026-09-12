@@ -1,0 +1,15 @@
+{
+  "name": "FileHub 文件服务",
+  "short_name": "FileHub",
+  "description": "自建文件服务：上传、下载、分享链接管理",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#F4F6FA",
+  "theme_color": "#2563EB",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

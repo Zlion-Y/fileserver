@@ -45,6 +45,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 //go:embed public
@@ -71,7 +72,7 @@ var (
 
 // 注意：必须是 var 而非 const，否则 -ldflags "-X main.version=..." 注入不会生效
 var (
-	version   = "1.1.1"
+	version   = "1.3.0"
 	commit    = "unknown" // 构建时由 -ldflags 注入
 	buildTime = "unknown"
 	// changelogB64 当前版本更新日志（base64）。CI 构建时把上一 tag 到本 tag 的
@@ -789,6 +790,8 @@ type Share struct {
 	Password       string     `json:"-"`                      // 仅内存字段：管理端回显用，绝不持久化
 	PasswordHash   string     `json:"passwordHash,omitempty"` // PBKDF2 口令哈希，空 = 无密码
 	Mode           string     `json:"mode,omitempty"`         // "" = 直链下载（兼容旧记录），"page" = 确认页
+	Alias          string     `json:"alias,omitempty"`        // 自定义链接别名：/s/<alias>，对外发布更好看
+	Hotlink        bool       `json:"hotlink,omitempty"`      // 防盗链：带 Referer 且来源域名非本站时拒绝
 	Log            []ShareLog `json:"log,omitempty"`
 }
 
@@ -837,8 +840,9 @@ func saveConfig() {
 	// 若写盘放在锁外，两个并发保存者还会互相覆盖（旧快照后写，丢更新）。
 	cfgMu.Lock()
 	b, _ := json.MarshalIndent(cfg, "", "  ")
+	// 0600：config.json 里有管理密码哈希，任何备份/协作者都不应默认可读
 	tmp := dataPath("config.json") + ".tmp"
-	_ = os.WriteFile(tmp, b, 0o644)
+	_ = os.WriteFile(tmp, b, 0o600)
 	_ = os.Rename(tmp, dataPath("config.json"))
 	cfgMu.Unlock()
 }
@@ -849,6 +853,13 @@ func loadShares() {
 	}
 	var m map[string]*Share
 	if json.Unmarshal(b, &m) == nil && m != nil {
+		// 手工编辑/损坏的 shares.json 可能出现 "token": null，
+		// 任何后续遍历（publicOne/runTidy/moveShareSync）解引用都会 panic，这里直接剔除
+		for k, s := range m {
+			if s == nil {
+				delete(m, k)
+			}
+		}
 		shares = m
 	}
 	// 迁移：把 v1.0.15 及以前遗留的明文密码转成加密存储，并按需解密回内存
@@ -883,7 +894,8 @@ func saveShares() {
 	// 注意所有调用点都必须先 Unlock 才能调用本函数（Go 互斥锁不可重入）
 	shareMu.Lock()
 	b, _ := json.MarshalIndent(shares, "", "  ")
-	_ = os.WriteFile(tmp, b, 0o644)
+	// 0600：shares.json 含加密后的分享密码与访问日志，不应默认全局可读
+	_ = os.WriteFile(tmp, b, 0o600)
 	_ = os.Rename(tmp, dataPath("shares.json"))
 	shareMu.Unlock()
 }
@@ -1233,6 +1245,21 @@ func sanitizeName(name string) string {
 		return r
 	}, name)
 	name = strings.TrimSpace(name)
+	// Windows 保留设备名（含带扩展名形式如 CON.txt）无法正常创建/删除：
+	// 仅检查主名部分，命中时加前缀避让（保留原扩展名）
+	stem := name
+	if i := strings.IndexByte(stem, '.'); i >= 0 {
+		stem = stem[:i]
+	}
+	upper := strings.ToUpper(stem)
+	for _, reserved := range []string{"CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"} {
+		if upper == reserved {
+			name = "_" + name
+			break
+		}
+	}
 	if name == "" || name == "." || name == ".." {
 		name = "unnamed_" + strconv.FormatInt(time.Now().UnixMilli(), 10)
 	}
@@ -1242,6 +1269,43 @@ func newToken() string {
 	b := make([]byte, 9)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// normalizeAlias 归一化并校验分享别名：字母/数字/中划线/下划线/Unicode 字母（中文可），
+// 1~40 个字符；返回空串表示不合法。别名进 URL 路径段，不允许空格与分隔符类字符。
+func normalizeAlias(a string) string {
+	a = strings.TrimSpace(a)
+	if a == "" || len([]rune(a)) > 40 {
+		return ""
+	}
+	for _, r := range a {
+		switch {
+		case r == '-' || r == '_':
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case unicode.IsLetter(r): // 中文等 Unicode 字母
+		default:
+			return ""
+		}
+	}
+	return a
+}
+
+// aliasTaken 别名是否已被占用（等于任何现有 token，或等于其他分享的别名）。
+// 别名在 /s/<x> 里优先于 token 匹配，因此不允许与任何 token 重合造成遮蔽。
+func aliasTaken(alias, exceptToken string) bool {
+	shareMu.Lock()
+	defer shareMu.Unlock()
+	for tok, s := range shares {
+		if tok == alias && tok != exceptToken {
+			return true
+		}
+		if tok != exceptToken && s != nil && s.Alias == alias {
+			return true
+		}
+	}
+	return false
 }
 func aliveShare(s *Share) bool {
 	if s == nil {
@@ -1939,6 +2003,29 @@ func gcDlTickets() {
 
 // ---------------- 下载 ----------------
 // 计次判定在调用方（handleShareGet）发送前完成；这里只负责流式发送文件
+
+// contentDisposition 构造 RFC 5987 的 Content-Disposition 值。
+// 注意 filename* 的 ext-value 只允许百分号编码，不能用 url.QueryEscape ——
+// 它会把空格编码成 '+'，浏览器保存文件时 '+' 会被原样保留（"a b.txt" → "a+b.txt"）。
+func contentDisposition(kind, name string) string {
+	var b strings.Builder
+	if kind == "inline" {
+		b.WriteString("inline; filename*=UTF-8''")
+	} else {
+		b.WriteString("attachment; filename*=UTF-8''")
+	}
+	for _, r := range []byte(name) {
+		// RFC 5987 attr-char + UTF-8 明文字节直接放行，其余逐字节百分号编码
+		if r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' ||
+			strings.IndexByte("-_.!~*'()", r) >= 0 {
+			b.WriteByte(r)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", r)
+		}
+	}
+	return b.String()
+}
+
 func serveDownload(w http.ResponseWriter, r *http.Request, filePath, name string) {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -1951,8 +2038,7 @@ func serveDownload(w http.ResponseWriter, r *http.Request, filePath, name string
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Disposition",
-		fmt.Sprintf("attachment; filename*=UTF-8''%s", url.QueryEscape(name)))
+	w.Header().Set("Content-Disposition", contentDisposition("attachment", name))
 	// 禁止缓存：同一链接再次下载必须命中服务器，否则浏览器用本地缓存副本
 	// 保存「新下载」，既绕过计数也绕过次数限制
 	w.Header().Set("Cache-Control", "no-store")
@@ -1980,8 +2066,7 @@ func serveInline(w http.ResponseWriter, r *http.Request, filePath, name string) 
 		ct = t
 	}
 	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Content-Disposition",
-		fmt.Sprintf("inline; filename*=UTF-8''%s", url.QueryEscape(name)))
+	w.Header().Set("Content-Disposition", contentDisposition("inline", name))
 	w.Header().Set("Cache-Control", "no-store")
 	http.ServeContent(w, r, name, st.ModTime(), f)
 }
@@ -2078,6 +2163,12 @@ func serveStatic(w http.ResponseWriter, r *http.Request) {
 		ct = "image/svg+xml"
 	case ".json":
 		ct = "application/json; charset=utf-8"
+	case ".webmanifest":
+		ct = "application/manifest+json; charset=utf-8"
+	case ".png":
+		ct = "image/png"
+	case ".ico":
+		ct = "image/x-icon"
 	}
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
@@ -2135,6 +2226,47 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": true, "enabled": tidyEnabled(), "graceHours": tidyGrace()})
 	case p == "/api/tidy":
 		writeJSON(w, 200, map[string]any{"pending": tidyPending(), "graceHours": tidyGrace(), "enabled": tidyEnabled()})
+	// 下载统计：分享访问日志按天聚合最近 30 天（数据已在内存日志里，仅一次线性扫描）
+	case p == "/api/stats" && r.Method == http.MethodGet:
+		type dayStat struct {
+			Date      string `json:"date"`
+			Downloads int    `json:"downloads"`
+			Previews  int    `json:"previews"`
+			Fails     int    `json:"fails"`
+		}
+		days := make([]dayStat, 30)
+		now := time.Now().Local()
+		for i := range days {
+			days[i].Date = now.AddDate(0, 0, -(29 - i)).Format("01-02")
+		}
+		midnight := func(t time.Time) time.Time {
+			t = t.Local()
+			return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+		}
+		today0 := midnight(now)
+		shareMu.Lock()
+		for _, s := range shares {
+			if s == nil {
+				continue
+			}
+			for _, l := range s.Log {
+				diff := int(today0.Sub(midnight(time.UnixMilli(l.At))).Hours() / 24)
+				if diff < 0 || diff > 29 {
+					continue
+				}
+				i := 29 - diff
+				switch {
+				case !l.OK:
+					days[i].Fails++
+				case l.Note == "预览":
+					days[i].Previews++
+				default:
+					days[i].Downloads++
+				}
+			}
+		}
+		shareMu.Unlock()
+		writeJSON(w, 200, map[string]any{"days": days})
 	// 安全与会话：会话列表 / 踢出会话 / 修改管理密码
 	case p == "/api/sessions" && r.Method == http.MethodGet:
 		handleSessionsList(w, r)
@@ -2250,6 +2382,17 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 			handleMkdir(w, r, root)
 		case p == "/api/upload" && r.Method == http.MethodPost:
 			handleUpload(w, r, root)
+		// 分片断点续传上传
+		case p == "/api/upload/init" && r.Method == http.MethodPost:
+			handleUploadInit(w, r, root)
+		case p == "/api/upload/complete" && r.Method == http.MethodPost:
+			handleUploadComplete(w, r, root)
+		case p == "/api/upload/chunk" && r.Method == http.MethodPut:
+			handleUploadChunk(w, r)
+		case p == "/api/upload/chunk" && r.Method == http.MethodDelete:
+			handleUploadAbort(w, r)
+		case p == "/api/upload/status" && r.Method == http.MethodGet:
+			handleUploadStatus(w, r)
 		case p == "/api/item" && r.Method == http.MethodDelete:
 			handleDelete(w, r, root)
 		case p == "/api/download":
@@ -2396,11 +2539,21 @@ func handleList(w http.ResponseWriter, r *http.Request, root string) {
 		writeJSON(w, 400, map[string]any{"error": "目录不存在"})
 		return
 	}
-	items, _ := os.ReadDir(dir)
+	items, err := os.ReadDir(dir)
+	if err != nil {
+		// 静默返回空列表会让人误以为目录是空的（进而执行删除/重建等危险操作），
+		// 必须把读取失败显式抛给前端
+		writeJSON(w, 500, map[string]any{"error": "读取目录失败: " + err.Error()})
+		return
+	}
 	entries := []map[string]any{}
 	for _, it := range items {
 		// 根目录下的回收站不进入常规列表（回收站有专页）
 		if it.Name() == trashDirName && rel == "" {
+			continue
+		}
+		// 分片上传的临时文件对列表不可见（完成前是半成品）
+		if isUploadTemp(it.Name()) {
 			continue
 		}
 		info, err := it.Info()
@@ -2681,6 +2834,267 @@ func handleUpload(w http.ResponseWriter, r *http.Request, root string) {
 // errFileTooLarge 单文件超过 --max-upload-mb（由 saveStreamExcl 判定）
 var errFileTooLarge = errors.New("文件大小超过限制")
 
+// ---------------- 分片断点续传上传 ----------------
+//
+// 大文件走「init → 逐片 PUT 追加 → complete 原子改名」三步：
+//   - 分片文件落在目标目录内（.fup-<id>.part），保证 complete 时同盘 rename 原子生效；
+//   - 每片必须从「当前已收字节数」处顺序追加，重试/重放不会写坏偏移；
+//   - 会话在内存里，服务重启后客户端重新 init 即可；init 时顺带清理同目录
+//     超 24h 的孤儿分片（崩溃/放弃上传留下的），不额外跑全盘扫描。
+
+const (
+	uploadTempPrefix = ".fup-"
+	uploadTempSuffix = ".part"
+	uploadChunkMax   = 64 << 20 // 单片上限 64MB，防恶意大 body
+	uploadTempTTL    = 24 * time.Hour
+)
+
+type uploadSession struct {
+	ID       string
+	Dir      string
+	Name     string
+	Size     int64
+	Received int64
+	Created  time.Time
+}
+
+var (
+	upSessMu  sync.Mutex
+	upSessMap = map[string]*uploadSession{}
+)
+
+func isUploadTemp(name string) bool {
+	return strings.HasPrefix(name, uploadTempPrefix) && strings.HasSuffix(name, uploadTempSuffix)
+}
+
+// handleUploadInit POST /api/upload/init {dir,name,size} → {id}
+func handleUploadInit(w http.ResponseWriter, r *http.Request, root string) {
+	var body struct {
+		Dir  string `json:"dir"`
+		Name string `json:"name"`
+		Size int64  `json:"size"`
+	}
+	if err := decodeStrict(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
+		return
+	}
+	if body.Size < 0 {
+		writeJSON(w, 400, map[string]any{"error": "size 不合法"})
+		return
+	}
+	if flagMaxMB > 0 && body.Size > flagMaxMB*1024*1024 {
+		writeJSON(w, http.StatusRequestEntityTooLarge,
+			map[string]any{"error": fmt.Sprintf("文件超过 %dMB 限制", flagMaxMB)})
+		return
+	}
+	dir, err := safeJoin(root, body.Dir)
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"error": err.Error()})
+		return
+	}
+	if !ensureCreatableInside(root, dir) {
+		writeJSON(w, 400, map[string]any{"error": "非法路径"})
+		return
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		writeJSON(w, 400, map[string]any{"error": "目标目录不存在或不可创建"})
+		return
+	}
+	name := sanitizeName(body.Name)
+	if name == "" {
+		writeJSON(w, 400, map[string]any{"error": "文件名不能为空"})
+		return
+	}
+	// 顺带清理同目录里超过 TTL 的孤儿分片（崩溃/放弃上传遗留）
+	if items, err := os.ReadDir(dir); err == nil {
+		for _, it := range items {
+			if !isUploadTemp(it.Name()) {
+				continue
+			}
+			if info, err := it.Info(); err == nil && time.Since(info.ModTime()) > uploadTempTTL {
+				_ = os.Remove(filepath.Join(dir, it.Name()))
+			}
+		}
+	}
+	buf := make([]byte, 12)
+	if _, err := rand.Read(buf); err != nil {
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		return
+	}
+	id := hex.EncodeToString(buf)
+	part := filepath.Join(dir, uploadTempPrefix+id+uploadTempSuffix)
+	f, err := os.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		return
+	}
+	_ = f.Close()
+	sess := &uploadSession{ID: id, Dir: dir, Name: name, Size: body.Size, Created: time.Now()}
+	upSessMu.Lock()
+	upSessMap[id] = sess
+	upSessMu.Unlock()
+	writeJSON(w, 200, map[string]any{"ok": true, "id": id})
+}
+
+// handleUploadChunk PUT /api/upload/chunk?id=&offset= —— body 为原始分片字节
+func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	offset, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
+	upSessMu.Lock()
+	sess := upSessMap[id]
+	upSessMu.Unlock()
+	if sess == nil {
+		writeJSON(w, 404, map[string]any{"error": "上传会话不存在（可能服务已重启），请重新初始化", "code": "NO_SESSION"})
+		return
+	}
+	if offset != sess.Received {
+		// 追加偏移不匹配：把服务端实际进度还给客户端，便于从正确位置续传
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "分片偏移不匹配", "received": sess.Received})
+		return
+	}
+	var src io.Reader = io.LimitReader(r.Body, uploadChunkMax+1)
+	if flagMaxMB > 0 {
+		src = io.LimitReader(r.Body, flagMaxMB*1024*1024-sess.Received+1)
+	}
+	part := filepath.Join(sess.Dir, uploadTempPrefix+sess.ID+uploadTempSuffix)
+	f, err := os.OpenFile(part, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		return
+	}
+	n, err := io.Copy(f, src)
+	closeErr := f.Close()
+	if err != nil || closeErr != nil {
+		writeJSON(w, 500, map[string]any{"error": "分片写入失败"})
+		return
+	}
+	if n == uploadChunkMax+1 {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "单片超过 64MB 上限"})
+		return
+	}
+	if flagMaxMB > 0 && sess.Received+n > flagMaxMB*1024*1024 {
+		writeJSON(w, http.StatusRequestEntityTooLarge,
+			map[string]any{"error": fmt.Sprintf("文件超过 %dMB 限制", flagMaxMB)})
+		return
+	}
+	upSessMu.Lock()
+	sess.Received += n
+	upSessMu.Unlock()
+	writeJSON(w, 200, map[string]any{"ok": true, "received": sess.Received})
+}
+
+// handleUploadComplete POST /api/upload/complete?id= → 校验长度后原子改名为最终文件
+func handleUploadComplete(w http.ResponseWriter, r *http.Request, root string) {
+	id := r.URL.Query().Get("id")
+	upSessMu.Lock()
+	sess := upSessMap[id]
+	upSessMu.Unlock()
+	if sess == nil {
+		writeJSON(w, 404, map[string]any{"error": "上传会话不存在"})
+		return
+	}
+	part := filepath.Join(sess.Dir, uploadTempPrefix+sess.ID+uploadTempSuffix)
+	st, err := os.Stat(part)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": "分片文件丢失"})
+		return
+	}
+	if sess.Size > 0 && st.Size() != sess.Size {
+		// 不删除会话：客户端补齐缺失分片后可直接再次 complete
+		writeJSON(w, 400, map[string]any{
+			"error":    fmt.Sprintf("分片不完整：已收 %d / 共 %d 字节", st.Size(), sess.Size),
+			"received": st.Size()})
+		return
+	}
+	if flagMaxMB > 0 && st.Size() > flagMaxMB*1024*1024 {
+		upSessMu.Lock()
+		delete(upSessMap, id)
+		upSessMu.Unlock()
+		_ = os.Remove(part)
+		writeJSON(w, http.StatusRequestEntityTooLarge,
+			map[string]any{"error": fmt.Sprintf("文件超过 %dMB 限制", flagMaxMB)})
+		return
+	}
+	// 最终名占用（含并发完成）时与普通上传一致加 (1)(2) 后缀
+	final, err := exclusiveName(sess.Dir, sess.Name)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := os.Rename(part, final); err != nil {
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		return
+	}
+	upSessMu.Lock()
+	delete(upSessMap, id)
+	upSessMu.Unlock()
+	_ = root // root 仅用于与其它接口签名一致；写盘路径已由会话校验过
+	writeJSON(w, 200, map[string]any{"ok": true, "files": []map[string]any{
+		{"name": filepath.Base(final), "path": final, "size": st.Size()},
+	}})
+}
+
+// exclusiveName 在 dir 内为 name 找一个不冲突的名字（name、name(1).ext、name(2).ext…）
+func exclusiveName(dir, name string) (string, error) {
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	for i := 0; ; i++ {
+		cand := name
+		if i > 0 {
+			cand = fmt.Sprintf("%s(%d)%s", stem, i, ext)
+		}
+		p := filepath.Join(dir, cand)
+		if _, err := os.Lstat(p); os.IsNotExist(err) {
+			return p, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+}
+
+// handleUploadStatus GET /api/upload/status?id= → {received,size}（页面刷新后续传）
+func handleUploadStatus(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	upSessMu.Lock()
+	sess := upSessMap[id]
+	upSessMu.Unlock()
+	if sess == nil {
+		writeJSON(w, 404, map[string]any{"error": "上传会话不存在", "code": "NO_SESSION"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "received": sess.Received, "size": sess.Size})
+}
+
+// handleUploadAbort DELETE /api/upload/chunk?id= —— 放弃上传并删除分片
+func handleUploadAbort(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	upSessMu.Lock()
+	sess := upSessMap[id]
+	delete(upSessMap, id)
+	upSessMu.Unlock()
+	if sess != nil {
+		_ = os.Remove(filepath.Join(sess.Dir, uploadTempPrefix+sess.ID+uploadTempSuffix))
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// gcUploadSessions 回收超时上传会话（由每小时清理任务调用）
+func gcUploadSessions() {
+	cutoff := time.Now().Add(-uploadTempTTL)
+	upSessMu.Lock()
+	var stale []*uploadSession
+	for id, s := range upSessMap {
+		if s.Created.Before(cutoff) {
+			stale = append(stale, s)
+			delete(upSessMap, id)
+		}
+	}
+	upSessMu.Unlock()
+	for _, s := range stale {
+		_ = os.Remove(filepath.Join(s.Dir, uploadTempPrefix+s.ID+uploadTempSuffix))
+	}
+}
+
 // isMaxBytesErr 判断是否是 http.MaxBytesReader 触发的长度超限
 func isMaxBytesErr(err error) bool {
 	var mb *http.MaxBytesError
@@ -2756,6 +3170,10 @@ func zipAdd(zw *zip.Writer, root, abs, name string) error {
 			if root != "" && abs == root && it.Name() == trashDirName {
 				continue
 			}
+			// 分片上传的半成品同样不得借打包外泄
+			if isUploadTemp(it.Name()) {
+				continue
+			}
 			if err := zipAdd(zw, root, filepath.Join(abs, it.Name()), name+"/"+it.Name()); err != nil {
 				return err
 			}
@@ -2789,8 +3207,7 @@ func serveZipStream(w http.ResponseWriter, r *http.Request, root string, paths [
 		}
 	}
 	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition",
-		fmt.Sprintf("attachment; filename*=UTF-8''%s.zip", url.QueryEscape(zipName)))
+	w.Header().Set("Content-Disposition", contentDisposition("attachment", zipName)+".zip")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(200)
 	zw := zip.NewWriter(w)
@@ -3072,7 +3489,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request, root string) {
 			}
 			for _, it := range items {
 				name := it.Name()
-				if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "$") {
+				if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "$") || isUploadTemp(name) {
 					continue
 				}
 				scanned++
@@ -3214,6 +3631,9 @@ func davPropfind(w http.ResponseWriter, r *http.Request, root, rel string) {
 				if rel == "" && it.Name() == trashDirName {
 					continue
 				}
+				if isUploadTemp(it.Name()) {
+					continue
+				}
 				info, err := it.Info()
 				if err != nil {
 					continue
@@ -3287,6 +3707,9 @@ func davGet(w http.ResponseWriter, r *http.Request, root, rel string) {
 		b.WriteString(`</h2>`)
 		for _, it := range items {
 			if rel == "" && it.Name() == trashDirName {
+				continue
+			}
+			if isUploadTemp(it.Name()) {
 				continue
 			}
 			child := it.Name()
@@ -3492,7 +3915,9 @@ func davMove(w http.ResponseWriter, r *http.Request, root, rel string) {
 		return
 	}
 	overwrite := !strings.EqualFold(r.Header.Get("Overwrite"), "F")
+	existed := false
 	if _, err := os.Lstat(toAbs); err == nil {
+		existed = true
 		if !overwrite {
 			w.WriteHeader(412) // 目标已存在且 Overwrite: F
 			return
@@ -3512,7 +3937,12 @@ func davMove(w http.ResponseWriter, r *http.Request, root, rel string) {
 		return
 	}
 	moveShareSync(root, fromAbs, toAbs)
-	w.WriteHeader(201)
+	// RFC 4918 9.9.4：覆盖已有目标返回 204，新建返回 201
+	if existed {
+		w.WriteHeader(204)
+	} else {
+		w.WriteHeader(201)
+	}
 }
 
 // davProppatch 最小实现：一律应答 200（播放器客户端不校验属性写回结果）
@@ -3551,6 +3981,8 @@ func startTidy() {
 			}
 			// 分享密码防爆破记录：过期条目回收，防止 map 长期缓慢增长
 			sharePwGCSweep()
+			// 分片上传会话：超 24h 的会话连同分片文件一并回收
+			gcUploadSessions()
 		}
 	}()
 }
@@ -3634,6 +4066,8 @@ func handleShareCreate(w http.ResponseWriter, r *http.Request, root string) {
 		Host          string `json:"host"`
 		Password      string `json:"password"` // 空 = 无密码
 		Mode          string `json:"mode"`     // "direct"（默认）| "page"
+		Alias         string `json:"alias"`    // 可选：自定义链接别名
+		Hotlink       bool   `json:"hotlink"`  // 可选：防盗链
 	}
 	if err := decodeStrict(r, &body); err != nil {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
@@ -3699,6 +4133,19 @@ func handleShareCreate(w http.ResponseWriter, r *http.Request, root string) {
 		writeJSON(w, 400, map[string]any{"error": "有效期不能为负数"})
 		return
 	}
+	// 别名可选：填了就必须合法且未被占用，避免静默忽略让用户以为别名生效了
+	alias := ""
+	if strings.TrimSpace(body.Alias) != "" {
+		alias = normalizeAlias(body.Alias)
+		if alias == "" {
+			writeJSON(w, 400, map[string]any{"error": "别名不合法：仅限中英文、数字、中划线、下划线，1~40 字符"})
+			return
+		}
+		if aliasTaken(alias, "") {
+			writeJSON(w, 400, map[string]any{"error": "别名已被占用: " + alias})
+			return
+		}
+	}
 	token := newToken()
 	rec := &Share{
 		Token:        token,
@@ -3711,6 +4158,8 @@ func handleShareCreate(w http.ResponseWriter, r *http.Request, root string) {
 		Scheme:       body.Scheme,
 		Host:         body.Host,
 		Mode:         "",
+		Alias:        alias,
+		Hotlink:      body.Hotlink,
 	}
 	if body.Mode == "page" {
 		rec.Mode = "page"
@@ -3738,20 +4187,27 @@ func handleShareCreate(w http.ResponseWriter, r *http.Request, root string) {
 	if scheme == "auto" {
 		scheme = clientScheme(r)
 	}
+	// 设置了别名就返回别名链接（token 链接同样有效）
+	slug := rec.Token
+	if rec.Alias != "" {
+		slug = rec.Alias
+	}
 	writeJSON(w, 200, map[string]any{
 		"ok":    true,
 		"share": publicOne(rec),
-		"url":   fmt.Sprintf("%s://%s/s/%s", scheme, host, token),
+		"url":   fmt.Sprintf("%s://%s/s/%s", scheme, host, slug),
 	})
 }
 
 // handleShareUpdate 快速编辑分享：不删除重建，直接修改过期时间 / 密码 / 访问方式
 func handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Token     string `json:"token"`
-		ExpiresAt int64  `json:"expiresAt"` // 毫秒时间戳，0 = 永久
-		Password  string `json:"password"`  // 空 = 清除密码保护
-		Mode      string `json:"mode"`      // "direct"（默认）| "page"
+		Token     string  `json:"token"`
+		ExpiresAt int64   `json:"expiresAt"` // 毫秒时间戳，0 = 永久
+		Password  string  `json:"password"`  // 空 = 清除密码保护
+		Mode      string  `json:"mode"`      // "direct"（默认）| "page"
+		Alias     *string `json:"alias"`     // 可选：null = 不修改；"" = 清除别名
+		Hotlink   *bool   `json:"hotlink"`   // 可选：null = 不修改
 	}
 	if err := decodeStrict(r, &body); err != nil {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
@@ -3761,6 +4217,17 @@ func handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "过期时间不合法"})
 		return
 	}
+	if body.Alias != nil && strings.TrimSpace(*body.Alias) != "" {
+		alias := normalizeAlias(*body.Alias)
+		if alias == "" {
+			writeJSON(w, 400, map[string]any{"error": "别名不合法：仅限中英文、数字、中划线、下划线，1~40 字符"})
+			return
+		}
+		if aliasTaken(alias, body.Token) {
+			writeJSON(w, 400, map[string]any{"error": "别名已被占用: " + alias})
+			return
+		}
+	}
 	shareMu.Lock()
 	rec, ok := shares[body.Token]
 	if !ok {
@@ -3769,6 +4236,16 @@ func handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec.ExpiresAt = body.ExpiresAt
+	if body.Alias != nil {
+		if strings.TrimSpace(*body.Alias) == "" {
+			rec.Alias = ""
+		} else {
+			rec.Alias = normalizeAlias(*body.Alias)
+		}
+	}
+	if body.Hotlink != nil {
+		rec.Hotlink = *body.Hotlink
+	}
 	pw := strings.TrimSpace(body.Password)
 	if pw != "" {
 		setSharePassword(rec, pw)
@@ -3978,6 +4455,17 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 	// handleShareUpdate（写 ExpiresAt/Mode）、moveShareSync（写 AbsPath）竞争
 	shareMu.Lock()
 	live := shares[token]
+	if live == nil {
+		// 别名兜底：/s/<alias> 与 /s/<token> 等价；命中后换回真实 token，
+		// 后续日志/计次/防爆破键全部基于 token，别名的存在与否不影响计数
+		for tok, s := range shares {
+			if s != nil && s.Alias != "" && s.Alias == token {
+				live = shares[tok]
+				token = tok
+				break
+			}
+		}
+	}
 	var snap Share
 	if live != nil {
 		snap = *live
@@ -4000,6 +4488,20 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 		logFail("链接已过期")
 		writeJSON(w, 403, map[string]any{"error": "链接已过期"})
 		return
+	}
+	// 防盗链：开启后，带 Referer 且域名非本站的请求直接拒绝（直访/下载器不带 Referer 不受影响）
+	if rec.Hotlink {
+		if ref := r.Header.Get("Referer"); ref != "" {
+			if u, perr := url.Parse(ref); perr == nil && u.Host != "" {
+				if u.Host != r.Host && u.Host != clientHost(r) {
+					w.Header().Set("Content-Type", "text/html; charset=utf-8")
+					w.Header().Set("Cache-Control", "no-store")
+					w.WriteHeader(http.StatusForbidden)
+					_, _ = w.Write([]byte(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>禁止引用</title></head><body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;color:#5A6478"><p>此链接已开启防盗链，请从原页面打开或直接访问。</p></body></html>`))
+					return
+				}
+			}
+		}
 	}
 	// 先取文件状态：下面的配额豁免判定需要文件大小
 	st, err := os.Stat(rec.AbsPath)
@@ -4176,8 +4678,7 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 func serveShareZip(w http.ResponseWriter, rec *Share) {
 	root, _ := getRoot()
 	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition",
-		fmt.Sprintf("attachment; filename*=UTF-8''%s.zip", url.QueryEscape(rec.Name)))
+	w.Header().Set("Content-Disposition", contentDisposition("attachment", rec.Name)+".zip")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(200)
 	zw := zip.NewWriter(w)
