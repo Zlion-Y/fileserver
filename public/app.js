@@ -361,9 +361,15 @@ function renderTable(entries, opts) {
     empty.classList.add('hidden');
   }
   if (searchMode) {
-    // 搜索结果量小（SEARCH_LIMIT 限制）：客户端排序筛选 + 全量渲染
+    // 搜索结果量小（SEARCH_LIMIT 限制）：客户端排序筛选 + 全量渲染。
+    // 搜索结果固定渲染进表格：强制显示表格并隐藏相册（否则结果进了一个
+    // 仍被隐藏的容器，页面上什么都看不到）
     const shown = applyFilter(sortEntries(entries));
     pageState = { items: shown, total: shown.length, hasMore: false, loading: false, search: true };
+    const wrap = document.querySelector('.table-wrap');
+    if (wrap) wrap.classList.remove('hidden');
+    const g = $('#gallery');
+    if (g) g.classList.add('hidden');
     list.innerHTML = '';
     shown.forEach(e => list.appendChild(buildRow(e, true)));
   } else {
@@ -382,6 +388,17 @@ function renderTable(entries, opts) {
 let galleryOn = false;
 try { galleryOn = localStorage.getItem('fh-gallery') === '1'; } catch (e) {}
 
+// syncListContainer 统一同步「表格 / 相册」两个容器的互斥可见性。
+// 必须在 renderVirtual 和 renderGallery 两边都调用：renderGallery 切入相册时
+// 会隐藏 .table-wrap，切回列表的 renderVirtual 若不把它恢复，列表就"消失"了
+// （数据其实渲染了，容器还是 display:none），只能靠刷新页面恢复——实测踩过的坑
+function syncListContainer() {
+  const wrap = document.querySelector('.table-wrap');
+  const g = $('#gallery');
+  if (wrap) wrap.classList.toggle('hidden', galleryOn);
+  if (g) g.classList.toggle('hidden', !galleryOn);
+}
+
 function applyGalleryBtn() {
   const b = $('#btn-gallery');
   if (!b) return;
@@ -392,10 +409,8 @@ function applyGalleryBtn() {
 
 function renderGallery() {
   const g = $('#gallery');
-  const wrap = document.querySelector('.table-wrap');
   if (!g) return;
-  g.classList.toggle('hidden', !galleryOn);
-  if (wrap) wrap.classList.toggle('hidden', galleryOn);
+  syncListContainer();
   if (!galleryOn) return;
   g.innerHTML = '';
   const frag = document.createDocumentFragment();
@@ -525,6 +540,7 @@ function buildRow(e, searchMode) {
 function renderVirtual(depth) {
   const list = $('#list');
   if (!list || pageState.search) return;
+  syncListContainer();
   const items = pageState.items || [];
   if (!items.length) { list.innerHTML = ''; return; }
   const rect = list.getBoundingClientRect();
