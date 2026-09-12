@@ -40,13 +40,38 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
         run: |
+          # 把提交清单格式化成「- 标题 + 两空格缩进正文」；正文跳过空行与签名，
+          # 单条最多 12 行。此前只注入标题，提交正文里的详细修复清单全部丢失
+          format_changelog() {
+            git log --pretty=format:'%x00%s%n%b' "$1" | python3 -c '
+import sys
+out = []
+for blk in sys.stdin.read().split("\x00"):
+    lines = blk.replace("\r", "").split("\n")
+    subject = lines[0].strip()
+    if not subject:
+        continue
+    out.append("- " + subject)
+    shown = 0
+    for ln in lines[1:]:
+        t = ln.strip()
+        if not t or t.startswith("Signed-off-by:"):
+            continue
+        if shown >= 12:
+            out.append("  …")
+            break
+        out.append("  " + t)
+        shown += 1
+print("\n".join(out))
+'
+          }
           out=fileserver_${{ matrix.name }}
           if [ "${{ matrix.goos }}" = "windows" ]; then out="${out}.exe"; fi
           # 必须注入 goarmBuild：运行期 assetName() 靠它拼出 fileserver_linux_armv5/v7，
           # 缺失时 armv7 设备自更新会下载 armv5 产物（魔数校验能过，架构却是错的）
           LDFLAGS="-s -w -X main.version=${GITHUB_REF_NAME} -X main.commit=$(git rev-parse --short HEAD) -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           if [ -n "${GOARM:-}" ]; then LDFLAGS="${LDFLAGS} -X main.goarmBuild=${GOARM}"; fi
-          # 注入更新日志：上一 tag 到本 tag 的提交清单，程序内「检查更新」页离线展示。
+          # 注入更新日志：上一 tag 到本 tag 的提交清单（含提交正文），程序内「检查更新」页离线展示。
           # ldflags -X 不能直接带换行/引号/特殊字符（eval 重解析会炸），
           # 改用 base64 编码后注入，运行期 main.go 里解码还原。
           # 没有上一个 tag（仓库首个发布）时退化为「全部提交」，
@@ -54,11 +79,11 @@ jobs:
           CHANGELOG_B64=""
           PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${GITHUB_REF_NAME}$" | head -1 || true)
           if [ -n "${PREV_TAG}" ]; then
-            CHANGELOG=$(git log --pretty=format:'- %s' "${PREV_TAG}..${GITHUB_REF_NAME}" | head -30 || true)
             HEADER="本次更新（${PREV_TAG} → ${GITHUB_REF_NAME}）的提交："
+            CHANGELOG=$(format_changelog "${PREV_TAG}..${GITHUB_REF_NAME}" | head -100)
           else
-            CHANGELOG=$(git log --pretty=format:'- %s' -30 || true)
             HEADER="本次发布（${GITHUB_REF_NAME}）包含的提交："
+            CHANGELOG=$(format_changelog "-30" | head -100)
           fi
           if [ -n "${CHANGELOG}" ]; then
             CHANGELOG_B64=$(printf '%s\n%s' "${HEADER}" "${CHANGELOG}" | base64 -w0 || true)
@@ -83,10 +108,62 @@ jobs:
     permissions:
       contents: write
     steps:
+      # checkout + 全量历史：Release 说明在创建时就写入完整提交清单（含正文）。
+      # 直接 push（无 PR）时 GitHub 自动生成的说明只有一行 Full Changelog 链接，
+      # 已发布的旧版本客户端会拿它当「新版本更新内容」展示 —— 说明本身必须完整，
+      # 老版本不做任何升级也能读到全部更新内容
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 生成 Release 说明（含提交正文）
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${GITHUB_REF_NAME}$" | head -1 || true)
+          if [ -n "${PREV_TAG}" ]; then
+            HEADER="## 本次更新内容（${PREV_TAG} → ${GITHUB_REF_NAME}）"
+            RANGE="${PREV_TAG}..${GITHUB_REF_NAME}"
+            COMPARE="完整变更：https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
+          else
+            HEADER="## 本次发布（${GITHUB_REF_NAME}）包含的提交"
+            RANGE="-30"
+            COMPARE=""
+          fi
+          {
+            echo "${HEADER}"
+            echo ""
+            git log --pretty=format:'%x00%s%n%b' ${RANGE} | python3 -c '
+import sys
+out = []
+for blk in sys.stdin.read().split("\x00"):
+    lines = blk.replace("\r", "").split("\n")
+    subject = lines[0].strip()
+    if not subject:
+        continue
+    out.append("- " + subject)
+    shown = 0
+    for ln in lines[1:]:
+        t = ln.strip()
+        if not t or t.startswith("Signed-off-by:"):
+            continue
+        if shown >= 12:
+            out.append("  …")
+            break
+        out.append("  " + t)
+        shown += 1
+print("\n".join(out))
+'
+            if [ -n "${COMPARE}" ]; then
+              echo ""
+              echo "${COMPARE}"
+            fi
+          } > body.md
+          cat body.md
       - uses: actions/download-artifact@v4
         with: { path: dist, merge-multiple: true }
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          generate_release_notes: true
+          body_path: body.md
+          # 关闭自动生成：直接 push 仓库生成的只有一行 Full Changelog，
+          # 会作为噪音混进旧版本客户端展示的说明里；compare 链接已在 body 中给出
+          generate_release_notes: false

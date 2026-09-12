@@ -72,7 +72,7 @@ var (
 
 // 注意：必须是 var 而非 const，否则 -ldflags "-X main.version=..." 注入不会生效
 var (
-	version   = "1.3.2"
+	version   = "1.3.3"
 	commit    = "unknown" // 构建时由 -ldflags 注入
 	buildTime = "unknown"
 	// changelogB64 当前版本更新日志（base64）。CI 构建时把上一 tag 到本 tag 的
@@ -306,8 +306,23 @@ func isAutoNotes(body string) bool {
 	return true
 }
 
+// stripAutoFooter 去掉 GitHub 自动说明尾部的 **Full Changelog** 链接。
+// 它是 compare 链接的 markdown 原文，在更新页里渲染成纯文本噪音
+func stripAutoFooter(body string) string {
+	lines := strings.Split(body, "\n")
+	out := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		if strings.HasPrefix(strings.TrimSpace(ln), "**Full Changelog**") {
+			continue
+		}
+		out = append(out, ln)
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
 // enrichNotes 说明缺内容时，用本版本相对上一版本的提交记录补出可读的更新内容
 func enrichNotes(tag, body string) string {
+	body = stripAutoFooter(body)
 	if !isAutoNotes(body) {
 		return body
 	}
@@ -346,7 +361,32 @@ func prevTagOf(tag string) string {
 	return ""
 }
 
-// commitsBetween 取两个 tag 之间的提交记录（旧 -> 新，最多 30 条）
+// writeCommitNote 把一条提交渲染成「- 标题 + 缩进正文」；返回 false 表示无有效内容。
+// 此前只取标题行，提交正文里的详细修复清单全部丢失，更新日志因此「显示不完全」；
+// 正文逐行缩进展示（跳过签名与空行），单条最多 12 行防刷屏
+func writeCommitNote(b *strings.Builder, msg string) bool {
+	lines := strings.Split(strings.TrimSpace(msg), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return false
+	}
+	b.WriteString("- " + strings.TrimSpace(lines[0]) + "\n")
+	shown := 0
+	for _, ln := range lines[1:] {
+		t := strings.TrimSpace(ln)
+		if t == "" || strings.HasPrefix(t, "Signed-off-by:") {
+			continue
+		}
+		if shown >= 12 {
+			b.WriteString("  …\n")
+			break
+		}
+		b.WriteString("  " + t + "\n")
+		shown++
+	}
+	return true
+}
+
+// commitsBetween 取两个 tag 之间的提交记录（旧 -> 新，最多 30 条，含说明正文）
 func commitsBetween(base, head string) (string, error) {
 	var cmp ghCompare
 	if err := ghGetJSON(fmt.Sprintf("https://api.github.com/repos/%s/compare/%s...%s",
@@ -356,17 +396,14 @@ func commitsBetween(base, head string) (string, error) {
 	var b strings.Builder
 	n := 0
 	for i := len(cmp.Commits) - 1; i >= 0 && n < 30; i-- {
-		msg := strings.TrimSpace(strings.SplitN(cmp.Commits[i].Commit.Message, "\n", 2)[0])
-		if msg == "" {
-			continue
+		if writeCommitNote(&b, cmp.Commits[i].Commit.Message) {
+			n++
 		}
-		b.WriteString("- " + msg + "\n")
-		n++
 	}
 	return b.String(), nil
 }
 
-// commitsOfRef 取某个 ref（tag / 分支）上的提交记录（旧 -> 新，最多 30 条）。
+// commitsOfRef 取某个 ref（tag / 分支）上的提交记录（旧 -> 新，最多 30 条，含说明正文）。
 // 用于没有「上一个版本」可比的首个发布：这样首版的「检查更新」页也能看到
 // 实际的提交清单，而不是 GitHub 自动生成的 Full Changelog 链接
 func commitsOfRef(ref string) (string, error) {
@@ -382,12 +419,9 @@ func commitsOfRef(ref string) (string, error) {
 	var b strings.Builder
 	n := 0
 	for i := len(list) - 1; i >= 0 && n < 30; i-- {
-		msg := strings.TrimSpace(strings.SplitN(list[i].Commit.Message, "\n", 2)[0])
-		if msg == "" {
-			continue
+		if writeCommitNote(&b, list[i].Commit.Message) {
+			n++
 		}
-		b.WriteString("- " + msg + "\n")
-		n++
 	}
 	return b.String(), nil
 }
