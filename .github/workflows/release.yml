@@ -41,29 +41,31 @@ jobs:
           GOARM: ${{ matrix.goarm }}
         run: |
           # 把提交清单格式化成「- 标题 + 两空格缩进正文」；正文跳过空行与签名，
-          # 单条最多 12 行。此前只注入标题，提交正文里的详细修复清单全部丢失
+          # 单条最多 12 行。此前只注入标题，提交正文里的详细修复清单全部丢失。
+          # 注意：python 脚本经 heredoc 写盘再执行 —— -c '...' 的零缩进行会截断 YAML 块
+          cat > /tmp/fmt_changelog.py <<'PYEOF'
+          import sys
+          out = []
+          for blk in sys.stdin.read().split("\x00"):
+              lines = blk.replace("\r", "").split("\n")
+              subject = lines[0].strip()
+              if not subject:
+                  continue
+              out.append("- " + subject)
+              shown = 0
+              for ln in lines[1:]:
+                  t = ln.strip()
+                  if not t or t.startswith("Signed-off-by:"):
+                      continue
+                  if shown >= 12:
+                      out.append("  …")
+                      break
+                  out.append("  " + t)
+                  shown += 1
+          print("\n".join(out))
+          PYEOF
           format_changelog() {
-            git log --pretty=format:'%x00%s%n%b' "$1" | python3 -c '
-import sys
-out = []
-for blk in sys.stdin.read().split("\x00"):
-    lines = blk.replace("\r", "").split("\n")
-    subject = lines[0].strip()
-    if not subject:
-        continue
-    out.append("- " + subject)
-    shown = 0
-    for ln in lines[1:]:
-        t = ln.strip()
-        if not t or t.startswith("Signed-off-by:"):
-            continue
-        if shown >= 12:
-            out.append("  …")
-            break
-        out.append("  " + t)
-        shown += 1
-print("\n".join(out))
-'
+            git log --pretty=format:'%x00%s%n%b' "$1" | python3 /tmp/fmt_changelog.py
           }
           out=fileserver_${{ matrix.name }}
           if [ "${{ matrix.goos }}" = "windows" ]; then out="${out}.exe"; fi
@@ -117,6 +119,27 @@ print("\n".join(out))
           fetch-depth: 0
       - name: 生成 Release 说明（含提交正文）
         run: |
+          cat > /tmp/fmt_changelog.py <<'PYEOF'
+          import sys
+          out = []
+          for blk in sys.stdin.read().split("\x00"):
+              lines = blk.replace("\r", "").split("\n")
+              subject = lines[0].strip()
+              if not subject:
+                  continue
+              out.append("- " + subject)
+              shown = 0
+              for ln in lines[1:]:
+                  t = ln.strip()
+                  if not t or t.startswith("Signed-off-by:"):
+                      continue
+                  if shown >= 12:
+                      out.append("  …")
+                      break
+                  out.append("  " + t)
+                  shown += 1
+          print("\n".join(out))
+          PYEOF
           PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${GITHUB_REF_NAME}$" | head -1 || true)
           if [ -n "${PREV_TAG}" ]; then
             HEADER="## 本次更新内容（${PREV_TAG} → ${GITHUB_REF_NAME}）"
@@ -130,27 +153,7 @@ print("\n".join(out))
           {
             echo "${HEADER}"
             echo ""
-            git log --pretty=format:'%x00%s%n%b' ${RANGE} | python3 -c '
-import sys
-out = []
-for blk in sys.stdin.read().split("\x00"):
-    lines = blk.replace("\r", "").split("\n")
-    subject = lines[0].strip()
-    if not subject:
-        continue
-    out.append("- " + subject)
-    shown = 0
-    for ln in lines[1:]:
-        t = ln.strip()
-        if not t or t.startswith("Signed-off-by:"):
-            continue
-        if shown >= 12:
-            out.append("  …")
-            break
-        out.append("  " + t)
-        shown += 1
-print("\n".join(out))
-'
+            git log --pretty=format:'%x00%s%n%b' ${RANGE} | python3 /tmp/fmt_changelog.py
             if [ -n "${COMPARE}" ]; then
               echo ""
               echo "${COMPARE}"
