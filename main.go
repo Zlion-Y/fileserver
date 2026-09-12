@@ -72,7 +72,7 @@ var (
 
 // 注意：必须是 var 而非 const，否则 -ldflags "-X main.version=..." 注入不会生效
 var (
-	version   = "1.3.1"
+	version   = "1.3.2"
 	commit    = "unknown" // 构建时由 -ldflags 注入
 	buildTime = "unknown"
 	// changelogB64 当前版本更新日志（base64）。CI 构建时把上一 tag 到本 tag 的
@@ -1294,9 +1294,8 @@ func normalizeAlias(a string) string {
 
 // aliasTaken 别名是否已被占用（等于任何现有 token，或等于其他分享的别名）。
 // 别名在 /s/<x> 里优先于 token 匹配，因此不允许与任何 token 重合造成遮蔽。
-func aliasTaken(alias, exceptToken string) bool {
-	shareMu.Lock()
-	defer shareMu.Unlock()
+// 注意：调用方必须已持有 shareMu（锁内版本），锁外的入口检查仅作快速失败
+func aliasTakenLocked(alias, exceptToken string) bool {
 	for tok, s := range shares {
 		if tok == alias && tok != exceptToken {
 			return true
@@ -1306,6 +1305,12 @@ func aliasTaken(alias, exceptToken string) bool {
 		}
 	}
 	return false
+}
+
+func aliasTaken(alias, exceptToken string) bool {
+	shareMu.Lock()
+	defer shareMu.Unlock()
+	return aliasTakenLocked(alias, exceptToken)
 }
 func aliveShare(s *Share) bool {
 	if s == nil {
@@ -1972,8 +1977,10 @@ func dlTicketValid(r *http.Request, token string) bool {
 }
 
 // setDlTicketCookie 首次计数下载后下发 ticket，后续 Range 续传凭此免计次；
-// 返回本次签发的 ticket（空串表示失败），供调用方把已下发字节数记到它头上
-func setDlTicketCookie(w http.ResponseWriter, token string) string {
+// cookiePath 按「用户当前访问的 /s/<别名或token>」精确限定：别名访问的链接
+// 若把 Cookie Path 绑到真实 token，续传请求（同别名 URL）会带不上 Cookie，
+// 限次链接中途断开就无法续传。返回签发的 ticket（空串表示失败）
+func setDlTicketCookie(w http.ResponseWriter, token, cookiePath string) string {
 	ticket := newDlTicket(token)
 	if ticket == "" {
 		return ""
@@ -1981,7 +1988,7 @@ func setDlTicketCookie(w http.ResponseWriter, token string) string {
 	http.SetCookie(w, &http.Cookie{
 		Name:     dlTicketCookie,
 		Value:    ticket,
-		Path:     "/s/" + token, // 精确作用域：不带入其他接口，也不与其他分享冲突
+		Path:     cookiePath, // 精确作用域：不带入其他接口，也不与其他分享冲突
 		MaxAge:   int(dlTicketTTL / time.Second),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
@@ -2850,12 +2857,15 @@ const (
 )
 
 type uploadSession struct {
-	ID       string
-	Dir      string
-	Name     string
-	Size     int64
-	Received int64
-	Created  time.Time
+	ID         string
+	Dir        string // 绝对路径（init 时已校验）
+	DirRel     string // 相对根目录路径，用于每次追加前复查目录是否被移入回收站
+	Name       string
+	Size       int64
+	Received   int64
+	Created    time.Time
+	LastActive time.Time
+	mu         sync.Mutex // 串行化「校验偏移→追加→推进 Received」，并发/重试分片不会交错写入
 }
 
 var (
@@ -2885,6 +2895,10 @@ func handleUploadInit(w http.ResponseWriter, r *http.Request, root string) {
 	if flagMaxMB > 0 && body.Size > flagMaxMB*1024*1024 {
 		writeJSON(w, http.StatusRequestEntityTooLarge,
 			map[string]any{"error": fmt.Sprintf("文件超过 %dMB 限制", flagMaxMB)})
+		return
+	}
+	if inTrashRel(body.Dir) {
+		writeJSON(w, 400, map[string]any{"error": "不能上传到回收站"})
 		return
 	}
 	dir, err := safeJoin(root, body.Dir)
@@ -2929,7 +2943,11 @@ func handleUploadInit(w http.ResponseWriter, r *http.Request, root string) {
 		return
 	}
 	_ = f.Close()
-	sess := &uploadSession{ID: id, Dir: dir, Name: name, Size: body.Size, Created: time.Now()}
+	now := time.Now()
+	// DirRel 由 init 时的绝对路径反推：后续追加用它复查目录是否已被移入回收站
+	dirRel := filepath.ToSlash(strings.TrimPrefix(strings.TrimPrefix(dir, root), string(filepath.Separator)))
+	sess := &uploadSession{ID: id, Dir: dir, DirRel: dirRel, Name: name,
+		Size: body.Size, Created: now, LastActive: now}
 	upSessMu.Lock()
 	upSessMap[id] = sess
 	upSessMu.Unlock()
@@ -2947,14 +2965,27 @@ func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]any{"error": "上传会话不存在（可能服务已重启），请重新初始化", "code": "NO_SESSION"})
 		return
 	}
+	// 「校验偏移 → 追加 → 推进 Received」必须在会话锁内一次完成：
+	// 全局锁只护 map，两个重试分片同时越过偏移检查会交错追加，文件即损坏
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	// 上传中途目录被删除/移入回收站：追加必须终止，否则文件会写进回收站副本
+	if inTrashRel(sess.DirRel) {
+		writeJSON(w, 404, map[string]any{"error": "目标目录已被删除或移动", "code": "NO_DIR"})
+		return
+	}
 	if offset != sess.Received {
 		// 追加偏移不匹配：把服务端实际进度还给客户端，便于从正确位置续传
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "分片偏移不匹配", "received": sess.Received})
 		return
 	}
-	var src io.Reader = io.LimitReader(r.Body, uploadChunkMax+1)
+	// 单片上限取「64MB」与「距总上限的剩余量+1」的较小者；
+	// 只用总上限做 LimitReader 时，大配额下单片可绕过 64MB 约束
+	var limit int64 = uploadChunkMax + 1
 	if flagMaxMB > 0 {
-		src = io.LimitReader(r.Body, flagMaxMB*1024*1024-sess.Received+1)
+		if rem := flagMaxMB*1024*1024 - sess.Received + 1; rem < limit {
+			limit = rem
+		}
 	}
 	part := filepath.Join(sess.Dir, uploadTempPrefix+sess.ID+uploadTempSuffix)
 	f, err := os.OpenFile(part, os.O_WRONLY|os.O_APPEND, 0o600)
@@ -2962,24 +2993,32 @@ func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return
 	}
-	n, err := io.Copy(f, src)
+	n, err := io.Copy(f, io.LimitReader(r.Body, limit))
 	closeErr := f.Close()
+	// 终止性失败（超限/写坏）：字节已追加进分片文件，Received 与文件大小从此错位，
+	// 必须整体作废（删文件+删会话），客户端从头重传，绝不能带病续传
+	fail := func(code int, msg string) {
+		_ = os.Remove(part)
+		upSessMu.Lock()
+		delete(upSessMap, id)
+		upSessMu.Unlock()
+		writeJSON(w, code, map[string]any{"error": msg, "code": "ABORTED"})
+	}
 	if err != nil || closeErr != nil {
-		writeJSON(w, 500, map[string]any{"error": "分片写入失败"})
+		fail(500, "分片写入失败")
 		return
 	}
 	if n == uploadChunkMax+1 {
-		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "单片超过 64MB 上限"})
+		fail(http.StatusRequestEntityTooLarge, "单片超过 64MB 上限")
 		return
 	}
 	if flagMaxMB > 0 && sess.Received+n > flagMaxMB*1024*1024 {
-		writeJSON(w, http.StatusRequestEntityTooLarge,
-			map[string]any{"error": fmt.Sprintf("文件超过 %dMB 限制", flagMaxMB)})
+		fail(http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("文件超过 %dMB 限制", flagMaxMB))
 		return
 	}
-	upSessMu.Lock()
 	sess.Received += n
-	upSessMu.Unlock()
+	sess.LastActive = time.Now()
 	writeJSON(w, 200, map[string]any{"ok": true, "received": sess.Received})
 }
 
@@ -2991,6 +3030,17 @@ func handleUploadComplete(w http.ResponseWriter, r *http.Request, root string) {
 	upSessMu.Unlock()
 	if sess == nil {
 		writeJSON(w, 404, map[string]any{"error": "上传会话不存在"})
+		return
+	}
+	// 与分片追加互斥：最后一个分片还在写时不允许改名
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if inTrashRel(sess.DirRel) {
+		upSessMu.Lock()
+		delete(upSessMap, id)
+		upSessMu.Unlock()
+		_ = os.Remove(filepath.Join(sess.Dir, uploadTempPrefix+sess.ID+uploadTempSuffix))
+		writeJSON(w, 404, map[string]any{"error": "目标目录已被删除或移动", "code": "NO_DIR"})
 		return
 	}
 	part := filepath.Join(sess.Dir, uploadTempPrefix+sess.ID+uploadTempSuffix)
@@ -3028,7 +3078,6 @@ func handleUploadComplete(w http.ResponseWriter, r *http.Request, root string) {
 	upSessMu.Lock()
 	delete(upSessMap, id)
 	upSessMu.Unlock()
-	_ = root // root 仅用于与其它接口签名一致；写盘路径已由会话校验过
 	writeJSON(w, 200, map[string]any{"ok": true, "files": []map[string]any{
 		{"name": filepath.Base(final), "path": final, "size": st.Size()},
 	}})
@@ -3073,25 +3122,30 @@ func handleUploadAbort(w http.ResponseWriter, r *http.Request) {
 	delete(upSessMap, id)
 	upSessMu.Unlock()
 	if sess != nil {
+		sess.mu.Lock() // 与追加互斥，避免删掉正在写入的分片
 		_ = os.Remove(filepath.Join(sess.Dir, uploadTempPrefix+sess.ID+uploadTempSuffix))
+		sess.mu.Unlock()
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
-// gcUploadSessions 回收超时上传会话（由每小时清理任务调用）
+// gcUploadSessions 回收超时上传会话（由每小时清理任务调用）。
+// 按最后活跃时间判定：慢速链路上的超大文件只要还在传就不误杀
 func gcUploadSessions() {
 	cutoff := time.Now().Add(-uploadTempTTL)
 	upSessMu.Lock()
 	var stale []*uploadSession
 	for id, s := range upSessMap {
-		if s.Created.Before(cutoff) {
+		if s.LastActive.Before(cutoff) {
 			stale = append(stale, s)
 			delete(upSessMap, id)
 		}
 	}
 	upSessMu.Unlock()
 	for _, s := range stale {
+		s.mu.Lock()
 		_ = os.Remove(filepath.Join(s.Dir, uploadTempPrefix+s.ID+uploadTempSuffix))
+		s.mu.Unlock()
 	}
 }
 
@@ -4175,6 +4229,12 @@ func handleShareCreate(w http.ResponseWriter, r *http.Request, root string) {
 		rec.ExpiresAt = time.Now().UnixMilli() + body.ExpireSeconds*1000
 	}
 	shareMu.Lock()
+	// 锁内复查别名：入口检查与插入之间有窗口，两个并发创建同名别名会双双通过
+	if alias != "" && aliasTakenLocked(alias, "") {
+		shareMu.Unlock()
+		writeJSON(w, 400, map[string]any{"error": "别名已被占用: " + alias})
+		return
+	}
 	shares[token] = rec
 	shareMu.Unlock()
 	saveShares()
@@ -4233,6 +4293,12 @@ func handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		shareMu.Unlock()
 		writeJSON(w, 404, map[string]any{"error": "分享不存在"})
+		return
+	}
+	// 锁内复查：入口检查与持锁修改之间别名可能已被其他请求占用
+	if body.Alias != nil && strings.TrimSpace(*body.Alias) != "" && aliasTakenLocked(normalizeAlias(*body.Alias), body.Token) {
+		shareMu.Unlock()
+		writeJSON(w, 400, map[string]any{"error": "别名已被占用: " + normalizeAlias(*body.Alias)})
 		return
 	}
 	rec.ExpiresAt = body.ExpiresAt
@@ -4421,6 +4487,8 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 	if i := strings.Index(token, "/"); i >= 0 {
 		token = token[:i]
 	}
+	// URL 里的原始别名/token（Cookie Path 要与它一致，续传请求才带得上 ticket）
+	urlSlug := token
 	if token == "" {
 		writeJSON(w, 404, map[string]any{"error": "缺少 token"})
 		return
@@ -4613,8 +4681,9 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 		appendShareLog(l, ip, ua, true, "")
 		shareMu.Unlock()
 		saveShares()
-		// 只有真实计过次的下载才拿到续传授权，伪造 Range 的头拿不到 ticket
-		issuedTicket = setDlTicketCookie(w, token)
+		// 只有真实计过次的下载才拿到续传授权，伪造 Range 的头拿不到 ticket；
+		// Cookie Path 用当前 URL 里的别名或 token，保证同 URL 的续传请求能带上
+		issuedTicket = setDlTicketCookie(w, token, "/s/"+urlSlug)
 		return true
 	}
 	noQuota := func() {

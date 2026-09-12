@@ -45,7 +45,12 @@ async function api(url, opt) {
     return null;
   }
   if (!r.ok && r.status === 409 && data && data.code === 'NO_ROOT') { showSetup(); return null; }
-  if (!r.ok) throw new Error((data && data.error) || ('请求失败 ' + r.status));
+  if (!r.ok) {
+    const err = new Error((data && data.error) || ('请求失败 ' + r.status));
+    err.status = r.status;
+    err.data = data;   // 带上响应体（如分片进度 received），调用方可据此恢复
+    throw err;
+  }
   return data;
 }
 let toastTimer;
@@ -351,6 +356,9 @@ function renderTable(entries, opts) {
   const list = $('#list');
   if (!list) return;
   const empty = $('#empty');
+  // 相册开关只在目录浏览时有意义：搜索结果固定渲染进表格
+  const gb = $('#btn-gallery');
+  if (gb) gb.classList.toggle('hidden', searchMode);
   if (!entries.length) {
     if (empty) {
       empty.classList.remove('hidden');
@@ -586,7 +594,8 @@ function vMoreRow() {
 }
 let vRaf = 0;
 function scheduleVirtual() {
-  if (pageState.search || vRaf) return;
+  // 相册模式：可见视图不依赖表格虚拟滚动，避免每帧空转重建隐藏的表格
+  if (pageState.search || galleryOn || vRaf) return;
   vRaf = requestAnimationFrame(() => { vRaf = 0; renderVirtual(); });
 }
 window.addEventListener('scroll', () => { scheduleVirtual(); loadListMore(false); }, { passive: true });
@@ -1046,49 +1055,71 @@ async function uploadSimple(file, dirPath, onProgress) {
 
 // uploadChunked 大文件：init → 逐片顺序追加 → complete。
 // 每片从「服务端已收字节数」处续传：409 冲突按服务端进度校正，网络错误重试，
-// 会话丢失（服务重启）自动重新 init 从头再传
+// complete 报分片不完整（400+received）时接回分片循环继续补传，
+// 会话丢失（服务重启/目录被删）自动重新 init
 async function uploadChunked(file, dirPath, onProgress) {
   const init = await api('/api/upload/init', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ dir: dirPath, name: file.name, size: file.size })
   });
-  let id = init.id, done = 0, restarts = 0;
-  const prog = (n) => { if (onProgress) onProgress(Math.max(n, 0), file.size); };
-  while (done < file.size) {
-    const end = Math.min(done + CHUNK_SIZE, file.size);
-    let attempt = 0, restart = false;
-    for (;;) {
-      try {
-        const xhr = new XMLHttpRequest();
-        xhr.open('PUT', '/api/upload/chunk?id=' + encodeURIComponent(id) + '&offset=' + done);
-        await xhrSend(xhr, file.slice(done, end), (loaded) => prog(done + loaded));
-        done = end;
-        break;
-      } catch (e) {
-        if (e.status === 409 && e.data && typeof e.data.received === 'number') {
-          done = Math.min(e.data.received, file.size); // 按服务端真实进度续传
+  let id = init.id, done = 0, restarts = 0, lastProg = 0;
+  // 进度只进不退：409/complete 校正回退偏移时避免进度条倒跳
+  const prog = (n) => {
+    n = Math.min(Math.max(n, lastProg), file.size);
+    lastProg = n;
+    if (onProgress) onProgress(n, file.size);
+  };
+  for (;;) {
+    if (done < file.size) {
+      const end = Math.min(done + CHUNK_SIZE, file.size);
+      let attempt = 0, restart = false;
+      for (;;) {
+        try {
+          const xhr = new XMLHttpRequest();
+          xhr.open('PUT', '/api/upload/chunk?id=' + encodeURIComponent(id) + '&offset=' + done);
+          await xhrSend(xhr, file.slice(done, end), (loaded) => prog(done + loaded));
+          done = end;
           break;
+        } catch (e) {
+          if (e.status === 409 && e.data && typeof e.data.received === 'number') {
+            done = Math.min(e.data.received, file.size); // 按服务端真实进度续传
+            break;
+          }
+          // 终止性失败：单片超限/总超限，服务端已作废会话，重试无意义
+          if (e.status === 413 || (e.data && e.data.code === 'ABORTED')) throw e;
+          if (e.status === 404 && (e.data && (e.data.code === 'NO_SESSION' || e.data.code === 'NO_DIR'))) {
+            if (e.data.code === 'NO_DIR') throw e; // 目录没了，重传也不会成功
+            if (++restarts > 3) throw e;
+            restart = true;
+            break;
+          }
+          if (++attempt >= CHUNK_RETRY) throw e;
+          await new Promise(r => setTimeout(r, 600 * attempt));
         }
-        if (e.status === 404 && e.data && e.data.code === 'NO_SESSION') {
-          if (++restarts > 3) throw e;
-          restart = true;
-          break;
-        }
-        if (++attempt >= CHUNK_RETRY) throw e;
-        await new Promise(r => setTimeout(r, 600 * attempt));
       }
+      if (restart) {
+        const again = await api('/api/upload/init', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dir: dirPath, name: file.name, size: file.size })
+        });
+        id = again.id; done = 0; prog(0);
+      }
+      continue;
     }
-    if (restart) {
-      const again = await api('/api/upload/init', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dir: dirPath, name: file.name, size: file.size })
+    // 全部字节已送达，请求落盘生效；分片不完整（校验失败）时按服务端进度补传
+    try {
+      await api('/api/upload/complete?id=' + encodeURIComponent(id), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
       });
-      id = again.id; done = 0; prog(0);
+      return;
+    } catch (e) {
+      if (e.data && typeof e.data.received === 'number' && e.data.received < file.size) {
+        done = e.data.received;
+        continue;
+      }
+      throw e;
     }
   }
-  await api('/api/upload/complete?id=' + encodeURIComponent(id), {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
-  });
 }
 
 // sendFile 统一入口：按大小自动选择上传方式
@@ -1270,17 +1301,38 @@ async function openPreview(rel, name, size) {
   else if (kind === 'vid') { vid.src = url; vid.classList.remove('hidden'); }
   else if (kind === 'aud') { aud.src = url; aud.classList.remove('hidden'); }
   else {
-    // 文本文件：直接走下载接口取原始字节，浏览器端解码渲染，服务端不做任何加工
+    // 文本文件：Range 请求只取前 2MB 并流式拼接，浏览器端解码渲染。
+    // 不能用 arrayBuffer() 一口读完——大"文本"（日志/CSV）会把整个文件灌进内存
     txt.classList.remove('hidden');
     txt.textContent = '加载中…';
     try {
-      const resp = await fetch(url);
-      if (!resp.ok) throw new Error('读取失败 ' + resp.status);
-      const buf = await resp.arrayBuffer();
-      const cut = Math.min(buf.byteLength, TXT_PREVIEW_MAX);
-      let text = new TextDecoder('utf-8', { fatal: false }).decode(buf.slice(0, cut));
-      if (buf.byteLength > TXT_PREVIEW_MAX) {
-        text += `\n\n…（文件过大，仅显示前 ${fmtSize(TXT_PREVIEW_MAX)}，共 ${fmtSize(buf.byteLength)}）`;
+      const resp = await fetch(url, { headers: { Range: 'bytes=0-' + (TXT_PREVIEW_MAX - 1) } });
+      if (!resp.ok && resp.status !== 206) throw new Error('读取失败 ' + resp.status);
+      // 206 = 服务端确认只回前 2MB；200 = 拿到了整个文件，总长看 Content-Length
+      let total = 0;
+      if (resp.status === 206) {
+        const m = /\/(\d+)$/.exec(resp.headers.get('content-range') || '');
+        total = m ? parseInt(m[1], 10) : 0;
+      } else {
+        total = parseInt(resp.headers.get('content-length') || '0', 10);
+      }
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let got = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        got += value.length;
+        if (got >= TXT_PREVIEW_MAX) { try { reader.cancel(); } catch (e) {} break; }
+      }
+      const buf = new Uint8Array(got);
+      let off = 0;
+      for (const c of chunks) { buf.set(c, off); off += c.length; }
+      let text = new TextDecoder('utf-8', { fatal: false }).decode(buf);
+      const truncated = total > got || (total === 0 && got >= TXT_PREVIEW_MAX);
+      if (truncated) {
+        text += `\n\n…（文件过大，仅显示前 ${fmtSize(got)}${total ? `，共 ${fmtSize(total)}` : ''}）`;
       }
       txt.textContent = text;
     } catch (e) {
