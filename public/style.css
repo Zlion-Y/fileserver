@@ -659,13 +659,18 @@ html[data-theme="dark"] .preview-body { background: rgba(0,0,0,.3); }
     gap: 2px; border-right: 0; border-bottom: 1px solid var(--line);
     padding: calc(8px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) 8px
              calc(12px + env(safe-area-inset-left));
-    overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
+    overflow-x: hidden; overflow-y: hidden;
   }
-  .sidebar::-webkit-scrollbar { display: none; }
   .logo { padding: 0 8px 0 0; flex-shrink: 0; font-size: 0; } /* 手机上只留图标，多让出 ~75px 给标签 */
   .logo-ic { width: 26px; height: 26px; }
-  .nav { flex-direction: row; flex-wrap: nowrap; flex: 0 0 auto; gap: 2px; }
+  /* 滚动放在 .nav 上而不是整个 .sidebar：深色模式/退出登录固定在右侧永远可见，
+     导航标签在中间横向滑动。曾改成 wrap 全平铺，7 个入口占掉半屏，不可接受 */
+  .nav {
+    flex-direction: row; flex-wrap: nowrap; flex: 1 1 auto; min-width: 0;
+    gap: 2px; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .nav::-webkit-scrollbar { display: none; }
   .nav-group { display: none; }
   /* 触控目标：原来的 32px 高度在手机上极易误触，按 44px 重排 */
   .nav-item {
@@ -692,14 +697,6 @@ html[data-theme="dark"] .preview-body { background: rgba(0,0,0,.3); }
   #disk-pill .pill-label + * { flex-shrink: 0; }
   .search-wrap { min-width: 0; }
   .search-wrap input { flex: 1 1 120px; min-width: 0; }
-  /* 顶部标签栏改为换行：整条需要 ~970px，横向滚动会让「深色模式/退出登录」
-     永远不可见；换行后两行放得下全部入口 */
-  .sidebar {
-    flex-wrap: wrap; overflow-x: visible; overflow-y: hidden;
-    row-gap: 2px;
-  }
-  .nav { flex-wrap: wrap; flex: 1 1 auto; row-gap: 2px; }
-  .sidebar-foot { border-left: 0; padding-left: 0; margin: 0 0 0 auto; }
   .disk-card { width: 100%; order: 2; }
   .page-head { flex-direction: column; }
   .page-head h1 { font-size: 20px; }
