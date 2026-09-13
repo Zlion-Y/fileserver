@@ -682,7 +682,7 @@ html[data-theme="dark"] .preview-body { background: rgba(0,0,0,.3); }
     border-top: 0; border-left: 1px solid var(--line); padding: 0 0 0 8px; margin: 0 0 0 auto;
     display: flex; align-items: center; gap: 4px; flex-shrink: 0; flex-direction: row;
   }
-  #theme-label { display: none; } /* 主题按钮只留图标，文字太长易溢出 */
+  #theme-label, #logout-label { display: none; } /* 主题/退出按钮只留图标，文字太长易溢出 */
   .disk-mini { display: none; }
   .page { padding: 14px 12px calc(30px + env(safe-area-inset-bottom)); }
   .topbar { padding: 10px 12px; }
