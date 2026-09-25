@@ -194,6 +194,12 @@ function switchView(name) {
   const target = $('#view-' + name);
   if (target) target.classList.remove('hidden');
   $$('.nav-item[data-view]').forEach(b => b.classList.toggle('active', b.dataset.view === name));
+  // 手机上导航横向滚动，切到的标签可能藏在屏幕外：把它滚回视野中央
+  // （block:'nearest' 避免带动整页纵向滚动）
+  const act = $('.nav-item[data-view].active');
+  if (act && act.scrollIntoView) {
+    try { act.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' }); } catch (e) {}
+  }
   // 顶栏搜索与面包屑只属于文件视图
   const inFiles = name === 'files';
   const tb = $('#topbar');
@@ -1919,7 +1925,7 @@ async function toggleShareLog(token, name, itemEl) {
         <div class="log-line">
           <span class="tag ${l.ok ? 'green' : 'red'}">${l.ok ? '✓ 成功' : '✗ 失败'}</span>
           ${l.note ? `<span class="tag red">${esc(l.note)}</span>` : ''}
-          <span class="tag">${esc(l.ip || '未知 IP')}</span>
+          <span class="tag tag-ip" title="${esc(l.ip || '')}">${esc(l.ip || '未知 IP')}</span>
           <span class="geo-slot" data-ip="${esc(l.ip || '')}"></span>
           <span class="tag log-time">${fmtTime(l.at)}</span>
         </div>

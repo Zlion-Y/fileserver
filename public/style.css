@@ -352,6 +352,8 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; color:
 /* IP 归属地标签：定位图标 + 省市区街道摘要，完整信息悬停可见 */
 .geo-tag { display: inline-flex; align-items: center; gap: 4px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
 .geo-tag svg { width: 11px; height: 11px; flex-shrink: 0; }
+/* IP 标签：IPv6 长达 39 字符，白名单内允许折行，避免把日志行撑出屏幕 */
+.tag-ip { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
 
 /* ---------- 目录选择 ---------- */
 .crumb-modal { margin-bottom: 12px; }
@@ -564,7 +566,7 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; color:
 .sess-item:last-child { border-bottom: 0; }
 .sess-main { flex: 1; min-width: 0; }
 .sess-line { font-size: 13.5px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.sess-ip { font-weight: 600; font-variant-numeric: tabular-nums; }
+.sess-ip { font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; min-width: 0; }
 .sess-meta { font-size: 12px; color: var(--t3); margin-top: 3px; }
 .pw-form { display: flex; flex-direction: column; gap: 10px; max-width: 320px; }
 .pw-form .input-sm { height: 38px; }
@@ -882,4 +884,23 @@ html[data-theme="dark"] .preview-body { background: rgba(0,0,0,.3); }
   .g-name { font-size: 11px; padding: 5px 6px; }
   #stats-chart { padding: 2px 6px 0; }
   .stats-note { width: 100%; margin-left: 0; }
+}
+
+/* ---------- 窄屏（≤560px）：导航改为「图标在上、小字在下」的紧凑双行 ----------
+   横排大药丸 7 个入口在手机上放不下，滑动时相邻标签只剩半个字、难以辨认和点按；
+   双行后单个标签仅 ~48px 宽，390px 屏几乎全部进屏，即使滚动也有淡出提示。 */
+@media (max-width: 560px) {
+  .logo { display: none; }
+  .nav-item {
+    flex-direction: column; gap: 3px; padding: 7px 6px; height: auto;
+    font-size: 10px; line-height: 1.15; border-radius: 10px;
+  }
+  .nav-item svg { width: 19px; height: 19px; }
+  .nav { scroll-snap-type: x proximity; }
+  .nav-item { scroll-snap-align: center; }
+  /* 两端淡出：告知「还有更多标签」，比被裁掉半个字友好 */
+  .nav {
+    -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 10px, #000 calc(100% - 10px), transparent 100%);
+    mask-image: linear-gradient(90deg, transparent 0, #000 10px, #000 calc(100% - 10px), transparent 100%);
+  }
 }
