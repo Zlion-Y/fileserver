@@ -2332,6 +2332,10 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		key := strings.TrimSpace(body.Key)
+		if len(key) > 256 {
+			writeJSON(w, 400, map[string]any{"error": "Key 过长（最多 256 字符）"})
+			return
+		}
 		cfgMu.Lock()
 		cfg.UapiKey = key
 		cfgMu.Unlock()
@@ -4553,7 +4557,32 @@ var (
 	geoMu     sync.Mutex
 	geoCache  = map[string]ipGeoEntry{}
 	geoClient = &http.Client{Timeout: 5 * time.Second}
+	// 上游限流：带 Key QPS 7、访客 QPS 4。批量查询虽并发封顶 4，但上游延迟
+	// 仅 ~300ms 时实际可达 ~13 req/s，会触发 429 且结果被当成失败缓存 10 分钟。
+	// 全局节流：相邻两次上游请求的「发起时刻」至少间隔如下，均留有余量
+	geoRateMu    sync.Mutex
+	geoNextStart time.Time
 )
+
+const (
+	geoIntervalKeyed   = 180 * time.Millisecond // 有 Key：≤5.5 req/s（限 7）
+	geoIntervalVisitor = 300 * time.Millisecond // 访客：≤3.3 req/s（限 4）
+)
+
+// throttleGeo 全局节流：为本次上游调用排定不早于 geoNextStart 的发起时刻并等待
+func throttleGeo(interval time.Duration) {
+	geoRateMu.Lock()
+	now := time.Now()
+	start := geoNextStart
+	if start.Before(now) {
+		start = now
+	}
+	geoNextStart = start.Add(interval)
+	geoRateMu.Unlock()
+	if d := time.Until(start); d > 0 {
+		time.Sleep(d)
+	}
+}
 
 // lookupIPGeo 带缓存查询单个 IP 的归属地（并发安全）
 func lookupIPGeo(rawIP string) ipGeo {
@@ -4584,16 +4613,44 @@ func lookupIPGeo(rawIP string) ipGeo {
 
 	geo := fetchGeoUapis(rawIP)
 	geoMu.Lock()
-	geoCache[rawIP] = ipGeoEntry{geo: geo, at: now}
+	geoCache[rawIP] = ipGeoEntry{geo: geo, at: time.Now()}
 	if len(geoCache) > geoMaxIPs {
+		// 先按各自 TTL 清过期（失败 10 分钟、成功 7 天）。
+		// 之前统一按 10 分钟清，缓存一旦装满，7 天内的新鲜成功结果也会被当成
+		// 过期项删掉，归属地缓存退化成 10 分钟，白白烧上游积分
 		for k, v := range geoCache {
-			if now.Sub(v.at) > geoBadTTL {
+			ttl := geoOKTTL
+			if v.geo.Source == "" {
+				ttl = geoBadTTL
+			}
+			if now.Sub(v.at) >= ttl {
 				delete(geoCache, k)
 			}
 		}
 	}
+	if len(geoCache) > geoMaxIPs {
+		// 全是新条目仍超限（短时间涌入大量新 IP）：按写入时间淘汰最旧的一半，
+		// 摊薄后续每次插入都触发全表扫描的成本
+		ents := make([]ipGeoEnt, 0, len(geoCache))
+		for k, v := range geoCache {
+			ents = append(ents, ipGeoEnt{k, v.at})
+		}
+		sort.Slice(ents, func(i, j int) bool { return ents[i].at.Before(ents[j].at) })
+		for _, e := range ents {
+			if len(geoCache) <= geoMaxIPs/2 {
+				break
+			}
+			delete(geoCache, e.k)
+		}
+	}
 	geoMu.Unlock()
 	return geo
+}
+
+// ipGeoEnt 缓存淘汰用的键-时间对
+type ipGeoEnt struct {
+	k  string
+	at time.Time
 }
 
 // uapiKey 归属地查询用的 UAPIs Key：环境变量 UAPI_KEY 优先，其次 data/config.json 的
@@ -4650,8 +4707,14 @@ func fetchJSON(url string, hdrs map[string]string) map[string]any {
 // 境外是英文（如 "United States Virginia Ashburn"），分词位数不可靠，整串放国家；
 // llc 是运营商简称（"移动"），比 isp 全称更适合行内展示
 func fetchGeoUapis(ip string) ipGeo {
+	key := uapiKey()
+	interval := geoIntervalVisitor
+	if key != "" {
+		interval = geoIntervalKeyed
+	}
+	throttleGeo(interval) // 全局排队起跑：并发再高也不会撞上 QPS 上限
 	var hdrs map[string]string
-	if key := uapiKey(); key != "" {
+	if key != "" {
 		// 有 Key 走计费额度（实测 Bearer 头会把限流切换为 billing-key-rate），
 		// 无 Key 不带头，走免注册访客积分
 		hdrs = map[string]string{"Authorization": "Bearer " + key}

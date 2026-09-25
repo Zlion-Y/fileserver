@@ -1887,8 +1887,9 @@ function geoShort(g) {
 function geoChipHTML(g, ip) {
   const short = geoShort(g);
   if (!short) return '';
+  const lan = g.source === 'local';
   const full = [g.country, g.prov, g.city, g.district, g.street].filter(Boolean).join(' · ');
-  const title = `位置：${full || '未知'}\n运营商：${g.isp || '未知'}\n数据源：${g.source || '未知'}\nIP：${ip}`;
+  const title = `位置：${lan ? '内网' : (full || '未知')}\n运营商：${g.isp || '未知'}\n数据源：${lan ? '内网' : (g.source || '未知')}\nIP：${ip}`;
   return `<span class="tag geo-tag" title="${esc(title)}">${icoPin}${esc(short)}</span>`;
 }
 // 把作用域内所有 <span class="geo-slot" data-ip="…"> 占位替换为归属地标签
