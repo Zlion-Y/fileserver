@@ -338,6 +338,16 @@
           </div>
           <div id="pw-status" class="upd-status"></div>
         </div>
+        <div class="card chdir-card">
+          <h2 class="sec-title">UAPIs Key（IP 归属地查询）</h2>
+          <div class="pw-form">
+            <input type="text" id="geo-key" class="input-sm" placeholder="粘贴 uapi- 开头的 Key" autocomplete="off" spellcheck="false">
+            <button id="geo-key-save" class="btn btn-primary">保存</button>
+            <button id="geo-key-clear" class="btn btn-soft">清除</button>
+          </div>
+          <div id="geo-key-status" class="upd-status"></div>
+          <p class="hint">用于分享访问日志 / 登录会话的 IP 归属地查询（<a href="https://uapis.cn" target="_blank" rel="noopener">uapis.cn</a>）。配置后走计费额度（QPS 7），不填走访客积分（QPS 4、1500 积分/月）。保存后立即生效，key 存于服务器 data/config.json，不会提交到仓库。</p>
+        </div>
       </div>
 
       <!-- ====== 回收站视图 ====== -->

@@ -321,18 +321,37 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; color:
 .result-meta { font-size: 12px; color: var(--t3); margin-top: 9px; line-height: 1.9; }
 .result-meta .tag { margin-right: 4px; }
 
-/* 分享管理 / 日志列表 */
+/* 分享管理（紧凑两行条目）/ 日志列表 */
 .mgr-list { overflow-y: auto; padding: 6px 20px; max-height: 56vh; }
-.mgr-item { display: flex; align-items: center; gap: 12px; padding: 12px 2px; border-bottom: 1px solid var(--line); }
+.mgr-item { display: flex; align-items: center; gap: 12px; padding: 9px 2px; border-bottom: 1px solid var(--line); }
 .mgr-item:last-child { border-bottom: 0; }
 .mgr-main { flex: 1; min-width: 0; }
-.mgr-name { font-size: 13.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.mgr-meta { font-size: 12px; color: var(--t3); margin-top: 4px; display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
-.mgr-meta code { word-break: break-all; }
+.mgr-line { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; min-width: 0; }
+.mgr-name { font-size: 13.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; }
+.mgr-sub { margin-top: 4px; flex-wrap: nowrap; }
+.mgr-sub .share-url {
+  flex: 1 1 auto; min-width: 0; font-size: 12px; color: var(--t3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer;
+}
+.mgr-sub .share-url:hover { color: var(--primary); }
+.mgr-aside { flex-shrink: 0; margin-left: auto; font-size: 11.5px; color: var(--t3); }
 .mgr-empty { padding: 46px; text-align: center; color: var(--t3); font-size: 13.5px; }
-.mgr-item .right-col { display: flex; flex-direction: column; gap: 6px; align-items: stretch; flex-shrink: 0; }
+/* 条目操作列：一行 28px 图标按钮（悬停有文字说明），替代竖排文字按钮 */
+.mgr-item .row-acts { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+.icon-btn {
+  width: 28px; height: 28px; padding: 0; border: 0; border-radius: 7px;
+  background: transparent; color: var(--t3); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: background .12s, color .12s;
+}
+.icon-btn svg { width: 15px; height: 15px; }
+.icon-btn:hover { background: var(--primary-soft); color: var(--primary); }
+.icon-btn.ico-danger:hover { background: var(--tag-red-bg); color: var(--red); }
 .log-item { align-items: flex-start; }
 .log-ua { font-size: 11.5px; color: var(--t3); margin-top: 4px; word-break: break-all; }
+/* IP 归属地标签：定位图标 + 省市区街道摘要，完整信息悬停可见 */
+.geo-tag { display: inline-flex; align-items: center; gap: 4px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+.geo-tag svg { width: 11px; height: 11px; flex-shrink: 0; }
 
 /* ---------- 目录选择 ---------- */
 .crumb-modal { margin-bottom: 12px; }
@@ -398,6 +417,8 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; color:
 .share-log .log-title { font-size: 12.5px; font-weight: 600; color: var(--t2); margin-bottom: 8px; }
 .share-log .log-row { padding: 6px 0; border-bottom: 1px dashed var(--line); font-size: 12px; }
 .share-log .log-row:last-child { border-bottom: 0; }
+.share-log .log-line { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.share-log .log-time { margin-left: auto; }
 .share-log .log-row .tag { margin-right: 4px; }
 
 /* 快速编辑分享（条目内展开） */
@@ -833,14 +854,21 @@ html[data-theme="dark"] .preview-body { background: rgba(0,0,0,.3); }
   .modal-foot { padding-bottom: calc(14px + env(safe-area-inset-bottom)); flex-wrap: wrap; }
   .modal-foot .btn { flex: 1; min-width: 120px; }
 
-  /* 分享管理 / 回收站 / 会话列表条目：右侧竖排按钮组改为换行横排，
+  /* 分享管理 / 回收站 / 会话列表条目：右侧按钮组换行横排，
      竖排会占掉一半宽度把文件名挤成两三个字 */
   .mgr-item, .trash-item, .sess-item { flex-wrap: wrap; row-gap: 8px; }
-  .mgr-item .right-col, .trash-item .right-col, .sess-item .right-col {
+  .trash-item .right-col, .sess-item .right-col {
     flex-direction: row; flex-wrap: wrap; width: 100%;
     gap: 8px; padding-top: 8px; border-top: 1px dashed var(--line);
   }
-  .mgr-item .right-col .btn, .trash-item .right-col .btn, .sess-item .right-col .btn { flex: 1; min-width: 72px; }
+  .trash-item .right-col .btn, .sess-item .right-col .btn { flex: 1; min-width: 72px; }
+  /* 分享条目：图标按钮组独占一行、右对齐，触控目标放大 */
+  .mgr-item .row-acts {
+    flex: 1 1 100%; justify-content: flex-end;
+    gap: 6px; padding-top: 8px; border-top: 1px dashed var(--line);
+  }
+  .mgr-item .icon-btn { width: 36px; height: 36px; }
+  .mgr-item .icon-btn svg { width: 17px; height: 17px; }
 
   /* 媒体/文本预览：占满弹窗，深色底衬托图片视频 */
   #preview-modal { padding: 0; padding-bottom: env(safe-area-inset-bottom); }

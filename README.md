@@ -36,7 +36,7 @@ Go 实现（零第三方库），前端经 `//go:embed` 编译进二进制，拷
 | 偏好记忆 | 排序 / 类型 / 大小筛选与当前目录、视图在刷新后自动恢复；「/」快捷键聚焦搜索框 |
 | WebDAV | `/dav/` 挂载文件根目录（Class 1：PROPFIND/GET/PUT/MKCOL/DELETE/MOVE），Salt Player 等播放器可直接连；Basic 认证同管理端 |
 | 直链 / 确认页 | 直链模式打开即下载；确认页模式先展示文件信息，点下载才计数 |
-| 分享访问日志 | 每条分享记录最近 50 次访问（IP / UA / 成败 / 失败原因），管理端可查 |
+| 分享访问日志 | 每条分享记录最近 50 次访问（IP / 归属地 / UA / 成败 / 失败原因），管理端可查；归属地精确到区县级 + 运营商（数据源 [UAPIs](https://uapis.cn)，配置 `UAPI_KEY` 走计费额度，未配置走访客积分；进程内缓存一周） |
 | 下载统计图 | 分享管理页顶部展示最近 30 天下载/失败趋势（canvas 客户端绘制，零服务端加工） |
 | 定时清理 | 后台每小时清理过期分享记录；保留时长与开关可在「定时清理」页直接配置并持久化（初始值取 `TIDY_HOURS`，默认 72） |
 | 访问控制 | 管理端需登录（或 Basic 认证）；分享链接 `/s/token` 免密 |
@@ -44,7 +44,7 @@ Go 实现（零第三方库），前端经 `//go:embed` 编译进二进制，拷
 | 检查更新 | 服务端代理查询 GitHub 最新 Release，提示新版本，并同时展示**当前版本**与**新版本**的更新内容 |
 | 一键自更新 | 发现新版本后点「一键更新」：服务器自动下载对应架构二进制 → 校验 → 原子替换 → 自动重启，全程无需登录服务器，并展示版本更新日志
 | 更新内容 | Release 说明若只有 GitHub 自动生成的 Full Changelog 链接，会自动用两版本之间的提交记录补全成可读清单 |
-| 分享管理 | 分享列表支持筛选（全部/有效/已过期/带密码/直链）、勾选批量撤销、条目内快速编辑（有效期/密码/访问方式），无需删除重建 |
+| 分享管理 | 紧凑两行条目（图标操作列），筛选（全部/有效/已过期/带密码/直链）、勾选批量撤销、条目内快速编辑（有效期/密码/访问方式），无需删除重建 |
 | 安全与会话 | 查看活跃登录会话（IP / 登录时间）、踢出其他会话、网页修改管理员密码（新密码哈希持久化，立即生效） |
 
 ## 快速开始
@@ -145,6 +145,7 @@ sudo nginx -t && sudo systemctl reload nginx
 | `SEARCH_LIMIT` | `200` | 全盘搜索最多返回条数（上限 1000） |
 | `MAX_UPLOAD_MB` | `0` | 单个文件上限（MB），0 为不限制；chunked（无 Content-Length）上传同样受限 |
 | `LOG` | `1` | 访问日志开关 |
+| `UAPI_KEY` | 无 | UAPIs（[uapis.cn](https://uapis.cn)）的 API Key，供 IP 归属地查询走计费额度（QPS 7）。三种填写方式：**管理后台「安全与会话」直接填**（保存即生效，写入 `data/config.json`）、`data/config.json` 的 `uapiKey` 字段（改后重启）、`UAPI_KEY` 环境变量（优先级最高，后台会提示锁定）。**不填则走免注册访客积分**（QPS 4、1500 积分/月）。key 属敏感信息：`data/` 已被 .gitignore 排除，勿写入仓库其他文件 |
 
 ## HTTP 接口
 
@@ -164,6 +165,8 @@ sudo nginx -t && sudo systemctl reload nginx
 | GET | `/api/download?path=` | 直接下载（管理端） |
 | POST | `/api/share` | 创建分享：`path / expireSeconds / maxDownloads / scheme / host` |
 | GET | `/api/shares` | 分享列表 |
+| GET | `/api/sharelog?token=` | 分享访问日志（最近 50 条：IP / UA / 成败 / 失败原因） |
+| GET | `/api/ipgeo?ips=a,b,c` | 批量查询 IP 归属地（单批 ≤30，并发 ≤4；数据源 UAPIs，区县级 + 运营商；配置 `UAPI_KEY` 或 `data/config.json` 的 `uapiKey` 走计费额度，默认访客积分） |
 | DELETE | `/api/share?token=` | 撤销分享 |
 | POST | `/api/zip` | 多选打包：`{"paths":["a.txt","dir"]}` → 流式 ZIP 下载 |
 | GET | `/api/trash` | 回收站列表 |

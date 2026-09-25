@@ -202,7 +202,7 @@ function switchView(name) {
   if (cb) cb.classList.toggle('hidden', !inFiles);
   if (name === 'shares') { loadShares(); loadStats(); }
   if (name === 'update') loadVersionInfo();
-  if (name === 'security') loadSessionsList();
+  if (name === 'security') { loadSessionsList(); loadGeoKeyStatus(); }
   if (name === 'chdir') enterChdirView();
   if (name === 'tidy') enterTidyView();
   if (name === 'trash') loadTrash();
@@ -348,6 +348,23 @@ function shareTagFor(rel, isDir) {
 function mkAction(text, cls, fn) {
   const b = document.createElement('button');
   b.className = 'btn ' + cls; b.textContent = text;
+  b.addEventListener('click', (ev) => { ev.stopPropagation(); fn(); });
+  return b;
+}
+// 行内图标按钮：28px 方块，悬停显色并带 title 文字说明，用于紧凑列表的操作列
+const icoCopy = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
+const icoOpen = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>`;
+const icoEdit = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg>`;
+const icoLog = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`;
+const icoTrash = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>`;
+const icoPin = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>`;
+function mkIconBtn(svg, title, cls, fn) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'icon-btn' + (cls ? ' ' + cls : '');
+  b.title = title;
+  b.setAttribute('aria-label', title);
+  b.innerHTML = svg;
   b.addEventListener('click', (ev) => { ev.stopPropagation(); fn(); });
   return b;
 }
@@ -1597,12 +1614,23 @@ async function loadShares() {
   renderShares();
 }
 // 统一状态标签组件：与文件列表「分享状态」列同一套颜色（失效红 / 倒计时蓝 / 永久绿）
+function fmtShortLeft(ts) {
+  const s = Math.floor((ts - Date.now()) / 1000);
+  if (s <= 0) return '已过期';
+  if (s < 60) return s + '秒';
+  if (s < 3600) return Math.floor(s / 60) + '分';
+  if (s < 86400) return Math.floor(s / 3600) + '时';
+  return Math.floor(s / 86400) + '天';
+}
 function shareStatusTag(s) {
   if (!s.alive) return '<span class="tag red">已失效</span>';
-  return s.expiresAt ? `<span class="tag blue">有效 · ${fmtLeft(s.expiresAt)}</span>` : '<span class="tag green">有效 · 永久</span>';
+  if (!s.expiresAt) return '<span class="tag green">永久有效</span>';
+  // 行内空间有限，倒计时用短格式，完整文案悬停可见
+  return `<span class="tag blue" title="有效期至 ${fmtTime(s.expiresAt)}（${fmtLeft(s.expiresAt)}）">${fmtShortLeft(s.expiresAt)}后过期</span>`;
 }
 function shareModeTag(s) {
-  return s.mode === 'page' ? '<span class="tag purple">确认页</span>' : '<span class="tag green">直链</span>';
+  // 直链是默认访问方式，行内不占标签位；只有确认页模式才显示
+  return s.mode === 'page' ? '<span class="tag purple">确认页</span>' : '';
 }
 // 密码标签：新版记录显示明文，点击复制；旧记录（升级前创建）未存明文则只显示标记
 function sharePwTag(s) {
@@ -1656,16 +1684,20 @@ function renderShares() {
     el.dataset.token = s.token;
     const cnt = s.maxDownloads > 0
       ? `<span class="tag">${s.downloads}/${s.maxDownloads} 次</span>`
-      : `<span class="tag green">不限次 (已下载 ${s.downloads})</span>`;
-    const aliasTag = s.alias ? `<span class="tag purple">别名 /s/${esc(s.alias)}</span>` : '';
+      : `<span class="tag green">已下 ${s.downloads} 次 · 不限</span>`;
     const hlTag = s.hotlink ? `<span class="tag">防盗链</span>` : '';
     el.innerHTML = `
       <input type="checkbox" class="row-check share-check" data-token="${esc(s.token)}" title="选择此分享">
       <div class="fi">${svgFile}</div>
       <div class="mgr-main">
-        <div class="mgr-name">${esc(s.name)}</div>
-        <div class="mgr-meta">${shareStatusTag(s)}${cnt}${sharePwTag(s)}${shareModeTag(s)}${aliasTag}${hlTag}<span class="tag">${fmtSize(s.size)}</span><span class="tag">${fmtTime(s.createdAt)}</span></div>
-        <div class="mgr-meta"><code>${esc(url)}</code></div>
+        <div class="mgr-line">
+          <span class="mgr-name" title="${esc(s.name)}">${esc(s.name)}</span>
+          ${shareStatusTag(s)}${cnt}${sharePwTag(s)}${shareModeTag(s)}${hlTag}
+        </div>
+        <div class="mgr-line mgr-sub">
+          <code class="share-url" title="点击复制完整链接&#10;${esc(url)}">${esc(url)}</code>
+          <span class="mgr-aside">${fmtSize(s.size)} · ${fmtTime(s.createdAt)}</span>
+        </div>
         <div class="share-edit hidden"></div>
         <div class="share-log hidden"></div>
       </div>`;
@@ -1673,8 +1705,13 @@ function renderShares() {
     // 注意 .share-edit 里的 <select> 与 .share-log 的文本都不在 a/button/input
     // 选择器内，若不整体排除，点击下拉框会把刚展开的编辑面板又收起来
     el.querySelector('.mgr-main').addEventListener('click', (e) => {
-      if (e.target.closest('a, button, input, select, [data-copy-pw], .share-edit, .share-log')) return;
+      if (e.target.closest('a, button, input, select, [data-copy-pw], .share-url, .share-edit, .share-log')) return;
       toggleShareEdit(s, el);
+    });
+    // URL 单行截断显示，点击复制完整链接
+    el.querySelector('.share-url').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      toast(await copyText(url) ? '链接已复制' : '复制失败，请手动复制');
     });
     // 密码标签点击复制：data-copy-pw 属性此前只被 closest 排除逻辑引用，
     // 从未绑定实际复制事件，点击无任何反应
@@ -1684,17 +1721,18 @@ function renderShares() {
         toast(await copyText(tag.dataset.copyPw) ? '密码已复制' : '复制失败，请手动复制');
       });
     });
+    // 操作收进一行 28px 图标按钮（悬停见文字说明），替代原先 5 个竖排文字按钮
     const right = document.createElement('div');
-    right.className = 'right-col';
-    right.appendChild(mkAction('复制链接', 'btn-primary mini', async () => {
+    right.className = 'row-acts';
+    right.appendChild(mkIconBtn(icoCopy, '复制链接', '', async () => {
       toast(await copyText(url) ? '链接已复制' : '复制失败');
     }));
-    right.appendChild(mkAction('打开', 'btn-soft mini', () => {
+    right.appendChild(mkIconBtn(icoOpen, '打开链接', '', () => {
       window.open(url, '_blank', 'noopener');
     }));
-    right.appendChild(mkAction('编辑', 'btn-soft mini', () => toggleShareEdit(s, el)));
-    right.appendChild(mkAction('日志', 'btn-soft mini', () => toggleShareLog(s.token, s.name, el)));
-    right.appendChild(mkAction('撤销', 'btn-soft mini btn-danger', async () => {
+    right.appendChild(mkIconBtn(icoEdit, '编辑分享', '', () => toggleShareEdit(s, el)));
+    right.appendChild(mkIconBtn(icoLog, '访问日志', '', () => toggleShareLog(s.token, s.name, el)));
+    right.appendChild(mkIconBtn(icoTrash, '撤销分享', 'ico-danger', async () => {
       if (!(await askConfirm('撤销分享', '撤销该分享链接？撤销后链接立即失效。'))) return;
       await api('/api/share?token=' + encodeURIComponent(s.token), { method: 'DELETE' });
       toast('已撤销'); refreshShares(); loadShares(); loadList(state.curPath);
@@ -1816,6 +1854,48 @@ on('#share-batch-revoke', 'click', async () => {
   refreshShares(); loadShares(); loadList(state.curPath);
 });
 
+/* ---------------- IP 归属地展示（访问日志 / 登录会话） ---------------- */
+// 结果前端也缓存一份：同一批日志/会话里的重复 IP、重复展开都不再发请求
+const geoCache = {};
+async function fetchGeo(ips) {
+  const need = [...new Set(ips.filter(ip => ip && !(ip in geoCache)))];
+  if (need.length) {
+    try {
+      const d = await api('/api/ipgeo?ips=' + encodeURIComponent(need.join(',')));
+      Object.assign(geoCache, (d && d.geos) || {});
+      need.forEach(ip => { if (!(ip in geoCache)) geoCache[ip] = {}; });
+    } catch (e) { need.forEach(ip => { geoCache[ip] = {}; }); }
+  }
+}
+// 紧凑摘要：湖北·荆门·钟祥·S311 移动；境内 IP 省略「中国」，境外保留国家；
+// 内网 IP 只显示「局域网」。查询失败返回空串，不占版面
+function geoShort(g) {
+  if (!g || (!g.country && !g.prov && !g.city && !g.district && !g.street && !g.isp)) return '';
+  if (g.source === 'local') return '局域网';
+  const chain = [];
+  if (g.country && !/^中国/.test(g.country)) chain.push(g.country);
+  [g.prov, g.city, g.district, g.street].forEach(x => { if (x) chain.push(x); });
+  if (!chain.length) return g.isp || '';
+  return g.isp ? chain.join('·') + ' ' + g.isp : chain.join('·');
+}
+function geoChipHTML(g, ip) {
+  const short = geoShort(g);
+  if (!short) return '';
+  const full = [g.country, g.prov, g.city, g.district, g.street].filter(Boolean).join(' · ');
+  const title = `位置：${full || '未知'}\n运营商：${g.isp || '未知'}\n数据源：${g.source || '未知'}\nIP：${ip}`;
+  return `<span class="tag geo-tag" title="${esc(title)}">${icoPin}${esc(short)}</span>`;
+}
+// 把作用域内所有 <span class="geo-slot" data-ip="…"> 占位替换为归属地标签
+async function fillGeoSlots(scope) {
+  const slots = [...scope.querySelectorAll('.geo-slot[data-ip]')];
+  const ips = slots.map(s => s.dataset.ip).filter(Boolean);
+  if (!ips.length) return;
+  await fetchGeo(ips);
+  slots.forEach(s => {
+    s.outerHTML = geoChipHTML(geoCache[s.dataset.ip], s.dataset.ip);
+  });
+}
+
 /* ---------------- 分享访问日志（行内展开） ---------------- */
 async function toggleShareLog(token, name, itemEl) {
   const pane = itemEl.querySelector('.share-log');
@@ -1836,13 +1916,17 @@ async function toggleShareLog(token, name, itemEl) {
     }
     const rows = d.log.slice().reverse().map(l => `
       <div class="log-row">
-        <span class="tag ${l.ok ? 'green' : 'red'}">${l.ok ? '✓ 下载成功' : '✗ 失败'}</span>
-        ${l.note ? `<span class="tag red">${esc(l.note)}</span>` : ''}
-        <span class="tag">${esc(l.ip || '未知 IP')}</span>
-        <span class="tag">${fmtTime(l.at)}</span>
+        <div class="log-line">
+          <span class="tag ${l.ok ? 'green' : 'red'}">${l.ok ? '✓ 成功' : '✗ 失败'}</span>
+          ${l.note ? `<span class="tag red">${esc(l.note)}</span>` : ''}
+          <span class="tag">${esc(l.ip || '未知 IP')}</span>
+          <span class="geo-slot" data-ip="${esc(l.ip || '')}"></span>
+          <span class="tag log-time">${fmtTime(l.at)}</span>
+        </div>
         ${l.ua ? `<div class="log-ua">${esc(l.ua)}</div>` : ''}
       </div>`).join('');
     pane.innerHTML = `<div class="log-title">访问日志 · ${esc(name)}（${d.log.length} 条）</div>${rows}`;
+    fillGeoSlots(pane); // 归属地异步补齐：先渲染日志，命中缓存即可即时显示
   } catch (e) {
     pane.innerHTML = `<div class="log-ua">${esc(e.message)}</div>`;
   }
@@ -2158,7 +2242,7 @@ async function loadSessionsList() {
     el.className = 'sess-item';
     el.innerHTML = `
       <div class="sess-main">
-        <div class="sess-line"><span class="sess-ip">${s.ip ? esc(s.ip) : 'IP 未记录（升级到 v1.0.13 之前的旧会话）'}</span>${s.current ? ' <span class="tag blue">当前会话</span>' : ''}</div>
+        <div class="sess-line"><span class="sess-ip">${s.ip ? esc(s.ip) : 'IP 未记录（升级到 v1.0.13 之前的旧会话）'}</span>${s.ip ? `<span class="geo-slot" data-ip="${esc(s.ip)}"></span>` : ''}${s.current ? ' <span class="tag blue">当前会话</span>' : ''}</div>
         <div class="sess-meta">登录于 ${fmtTime(s.createdAt)} · 过期于 ${fmtTime(s.expiresAt)}${s.ip ? '' : ' · 退出登录后重新登录即可记录 IP'}</div>
       </div>`;
     const right = document.createElement('div');
@@ -2178,7 +2262,59 @@ async function loadSessionsList() {
     el.appendChild(right);
     box.appendChild(el);
   });
+  fillGeoSlots(box);
 }
+
+/* ---------------- UAPIs Key（IP 归属地查询，安全与会话页配置） ---------------- */
+async function loadGeoKeyStatus() {
+  const st = $('#geo-key-status');
+  if (!st) return;
+  try {
+    const d = await api('/api/uapikey');
+    const input = $('#geo-key'), save = $('#geo-key-save'), clear = $('#geo-key-clear');
+    if (d.fromEnv) {
+      // 环境变量优先级最高，页面改了也不生效，直接锁掉避免误解
+      input.value = ''; input.disabled = true;
+      save.disabled = true; clear.disabled = true;
+      st.textContent = d.masked
+        ? `当前使用环境变量 UAPI_KEY（${d.masked}），如需修改请改环境变量`
+        : '当前使用环境变量 UAPI_KEY（值未知），如需修改请改环境变量';
+      return;
+    }
+    input.disabled = false; save.disabled = false; clear.disabled = false;
+    st.textContent = d.masked
+      ? `当前已配置：${d.masked}`
+      : '未配置，走免注册访客积分（QPS 4、1500 积分/月）';
+  } catch (e) { st.textContent = '加载失败：' + e.message; }
+}
+on('#geo-key-save', 'click', async () => {
+  const input = $('#geo-key');
+  const v = (input.value || '').trim();
+  if (!v) return toast('请先粘贴 Key；如需清空请点「清除」');
+  try {
+    const d = await api('/api/uapikey', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: v })
+    });
+    if (!d) return;
+    input.value = '';
+    $('#geo-key-status').textContent = `当前已配置：${d.masked}（已生效）`;
+    Object.keys(geoCache).forEach(k => { delete geoCache[k]; }); // 之前查失败的 IP 重新查
+    toast('Key 已保存并生效');
+  } catch (e) { toast(e.message); }
+});
+on('#geo-key-clear', 'click', async () => {
+  try {
+    const d = await api('/api/uapikey', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: '' })
+    });
+    if (!d) return;
+    $('#geo-key-status').textContent = '未配置，走免注册访客积分（QPS 4、1500 积分/月）';
+    Object.keys(geoCache).forEach(k => { delete geoCache[k]; });
+    toast('已清除，改走访客积分');
+  } catch (e) { toast(e.message); }
+});
 
 on('#pw-save', 'click', async () => {
   const st = $('#pw-status');

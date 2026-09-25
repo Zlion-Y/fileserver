@@ -792,6 +792,9 @@ type config struct {
 	AuthPassHash string `json:"authPassHash,omitempty"` // 网页「安全与会话」修改后的管理密码哈希（优先于 -pass/AUTH_PASS）
 	TidyEnabled  *bool  `json:"tidyEnabled,omitempty"`  // nil = 默认开启自动清理
 	TidyHours    int    `json:"tidyHours,omitempty"`    // >0 时优先于 TIDY_HOURS 环境变量
+	// UapiKey UAPIs.cn 的 API Key（IP 归属地查询用）。data/ 在 .gitignore 中，
+	// 写在这里不会进版本库；环境变量 UAPI_KEY 优先。留空 = 访客积分模式（免注册）
+	UapiKey string `json:"uapiKey,omitempty"`
 }
 
 // ShareLog 分享访问日志（每条分享最多保留 50 条）
@@ -2315,6 +2318,25 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 		handleSessionKick(w, r)
 	case p == "/api/password" && r.Method == http.MethodPost:
 		handlePasswordChange(w, r)
+	case p == "/api/uapikey" && r.Method == http.MethodGet:
+		// 回显只给打码值，完整 key 不出服务器；环境变量 UAPI_KEY 已设置时提示前端
+		envSet := os.Getenv("UAPI_KEY") != ""
+		key := uapiKey()
+		writeJSON(w, 200, map[string]any{"fromEnv": envSet, "masked": maskKey(key)})
+	case p == "/api/uapikey" && r.Method == http.MethodPost:
+		var body struct {
+			Key string `json:"key"`
+		}
+		if err := decodeStrict(r, &body); err != nil {
+			writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
+			return
+		}
+		key := strings.TrimSpace(body.Key)
+		cfgMu.Lock()
+		cfg.UapiKey = key
+		cfgMu.Unlock()
+		saveConfig()
+		writeJSON(w, 200, map[string]any{"ok": true, "masked": maskKey(key)})
 	case p == "/api/selfupdate" && r.Method == http.MethodPost:
 		// multipart = 手动上传更新包（服务器连不上 GitHub 时的本地替代路径）
 		if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
@@ -2499,6 +2521,8 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 				log = []ShareLog{}
 			}
 			writeJSON(w, 200, map[string]any{"token": token, "log": log})
+		case p == "/api/ipgeo":
+			handleIPGeo(w, r)
 		case p == "/api/move" && r.Method == http.MethodPost:
 			handleMove(w, r, root)
 		case p == "/api/search":
@@ -4494,6 +4518,221 @@ func appendShareLog(s *Share, ip, ua string, ok bool, note string) {
 	if len(s.Log) > 50 {
 		s.Log = s.Log[len(s.Log)-50:]
 	}
+}
+
+// ---------------- IP 归属地查询（分享访问日志 / 登录会话展示用） ----------------
+//
+// 数据源固定为 UAPIs（uapis.cn）的 ipinfo 接口（source=commercial，2 积分/次），
+// 精度到区县级 + 运营商。配置了 UAPIs Key（data/config.json 的 uapiKey 或 UAPI_KEY
+// 环境变量）走计费额度（QPS 7、额度更大），未配置走免注册访客积分（QPS 4、1500 积分/月）。
+// 查询结果进程内缓存：命中后不再出网；归属地本身极少变动。
+
+// ipGeo 归属地信息；空字段不序列化，前端按已有字段拼接展示
+type ipGeo struct {
+	Country  string `json:"country,omitempty"`
+	Prov     string `json:"prov,omitempty"`
+	City     string `json:"city,omitempty"`
+	District string `json:"district,omitempty"`
+	Street   string `json:"street,omitempty"`
+	ISP      string `json:"isp,omitempty"`
+	Source   string `json:"source,omitempty"` // 数据源标识：空 = 查询失败
+}
+
+type ipGeoEntry struct {
+	geo ipGeo
+	at  time.Time
+}
+
+const (
+	geoOKTTL  = 7 * 24 * time.Hour // 成功结果：归属地极少变动，缓存一周
+	geoBadTTL = 10 * time.Minute   // 失败结果：短缓存，避免每次打开日志都重试上游
+	geoMaxIPs = 4 * 1024           // 缓存条目上限，超出时顺手清掉过期项
+)
+
+var (
+	geoMu     sync.Mutex
+	geoCache  = map[string]ipGeoEntry{}
+	geoClient = &http.Client{Timeout: 5 * time.Second}
+)
+
+// lookupIPGeo 带缓存查询单个 IP 的归属地（并发安全）
+func lookupIPGeo(rawIP string) ipGeo {
+	rawIP = strings.TrimSpace(rawIP)
+	if rawIP == "" {
+		return ipGeo{}
+	}
+	ip := net.ParseIP(rawIP)
+	if ip == nil {
+		return ipGeo{}
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return ipGeo{ISP: "局域网", Source: "local"}
+	}
+	now := time.Now()
+	geoMu.Lock()
+	if e, ok := geoCache[rawIP]; ok {
+		ttl := geoOKTTL
+		if e.geo.Source == "" {
+			ttl = geoBadTTL
+		}
+		if now.Sub(e.at) < ttl {
+			geoMu.Unlock()
+			return e.geo
+		}
+	}
+	geoMu.Unlock()
+
+	geo := fetchGeoUapis(rawIP)
+	geoMu.Lock()
+	geoCache[rawIP] = ipGeoEntry{geo: geo, at: now}
+	if len(geoCache) > geoMaxIPs {
+		for k, v := range geoCache {
+			if now.Sub(v.at) > geoBadTTL {
+				delete(geoCache, k)
+			}
+		}
+	}
+	geoMu.Unlock()
+	return geo
+}
+
+// uapiKey 归属地查询用的 UAPIs Key：环境变量 UAPI_KEY 优先，其次 data/config.json 的
+// uapiKey 字段（管理后台保存即写到这里）；都为空则走访客积分模式（免注册，额度低）
+func uapiKey() string {
+	if v := os.Getenv("UAPI_KEY"); v != "" {
+		return strings.TrimSpace(v)
+	}
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return strings.TrimSpace(cfg.UapiKey)
+}
+
+// maskKey key 打码回显：uapi-ab12_…wX9z，完整值不出服务器
+func maskKey(k string) string {
+	k = strings.TrimSpace(k)
+	if k == "" {
+		return ""
+	}
+	r := []rune(k)
+	if len(r) <= 11 {
+		return "…"
+	}
+	return string(r[:7]) + "…" + string(r[len(r)-4:])
+}
+
+// fetchJSON URL 出 GET，把响应体解析为 JSON 对象（非 2xx / 超时 / 解析失败返回 nil）。
+// hdrs 为附加请求头（可为 nil）
+func fetchJSON(url string, hdrs map[string]string) map[string]any {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil
+	}
+	for k, v := range hdrs {
+		req.Header.Set(k, v)
+	}
+	resp, err := geoClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var v map[string]any
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&v); err != nil {
+		return nil
+	}
+	return v
+}
+
+// fetchGeoUapis UAPIs.cn ipinfo：source=commercial 精度到区县。
+// region 为空格分隔字符串：境内是 "中国 省份 城市 区县"（如 "中国 湖北省 荆门市 钟祥市"），
+// 境外是英文（如 "United States Virginia Ashburn"），分词位数不可靠，整串放国家；
+// llc 是运营商简称（"移动"），比 isp 全称更适合行内展示
+func fetchGeoUapis(ip string) ipGeo {
+	var hdrs map[string]string
+	if key := uapiKey(); key != "" {
+		// 有 Key 走计费额度（实测 Bearer 头会把限流切换为 billing-key-rate），
+		// 无 Key 不带头，走免注册访客积分
+		hdrs = map[string]string{"Authorization": "Bearer " + key}
+	}
+	v := fetchJSON("https://uapis.cn/api/v1/network/ipinfo?ip="+url.QueryEscape(ip)+"&source=commercial", hdrs)
+	if v == nil {
+		return ipGeo{}
+	}
+	region, _ := v["region"].(string)
+	// 个别冷门 IP 会返回 "*" 之类的占位垃圾，视为查询失败不展示
+	if strings.Trim(region, "*-·. ") == "" {
+		return ipGeo{}
+	}
+	g := ipGeo{ISP: geoStr(v, "llc", "isp"), Source: "UAPIs"}
+	parts := strings.Fields(region)
+	if len(parts) > 0 && parts[0] == "中国" {
+		g.Country = parts[0]
+		if len(parts) > 1 {
+			g.Prov = parts[1]
+		}
+		if len(parts) > 2 {
+			g.City = parts[2]
+		}
+		if len(parts) > 3 {
+			g.District = parts[3]
+		}
+		if d := geoStr(v, "district"); d != "" && g.District == "" {
+			g.District = d
+		}
+	} else {
+		g.Country = region
+	}
+	return g
+}
+
+// geoStr 从 JSON 对象里取第一个存在的字符串字段
+func geoStr(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if s, ok := m[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// handleIPGeo GET /api/ipgeo?ips=a,b,c → 批量查询归属地（管理端日志/会话展示用）。
+// 并发查询以缩短首屏等待；单批最多 30 个。
+func handleIPGeo(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	raw := q.Get("ips")
+	ips := strings.Split(raw, ",")
+	requested := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip == "" || net.ParseIP(ip) == nil {
+			continue
+		}
+		requested = append(requested, ip)
+		if len(requested) >= 30 {
+			break
+		}
+	}
+	out := make(map[string]ipGeo, len(requested))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	// 上游普遍限流（如 UAPIs QPS 4）：并发封顶，超出部分排队
+	sem := make(chan struct{}, 4)
+	for _, ip := range requested {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(ip string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			g := lookupIPGeo(ip)
+			mu.Lock()
+			out[ip] = g
+			mu.Unlock()
+		}(ip)
+	}
+	wg.Wait()
+	writeJSON(w, 200, map[string]any{"geos": out})
 }
 
 func htmlEsc(s string) string {
