@@ -2156,6 +2156,27 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "no-referrer")
+	// CSP：前端仅引用同源资源 + 内联脚本/样式（主题预执行、少量 style 属性）+
+	// favicon data: URL；UAPIs 归属地查询在服务端完成，浏览器端无外部请求。
+	// 即便未来某处出现 XSS，也难以加载外部脚本或外传数据。
+	w.Header().Set("Content-Security-Policy",
+		"default-src 'self'; "+
+			"script-src 'self' 'unsafe-inline'; "+
+			"style-src 'self' 'unsafe-inline'; "+
+			"img-src 'self' data:; "+
+			"connect-src 'self'; "+
+			"font-src 'self'; "+
+			"media-src 'self'; "+
+			"object-src 'none'; "+
+			"base-uri 'self'; "+
+			"form-action 'self'; "+
+			"frame-ancestors 'none'")
+	// HSTS 仅在确认客户端走 HTTPS 时下发（反代终止 TLS 的场景）；
+	// 纯 HTTP 内网部署时下发也会被浏览器忽略，但不加更严谨。
+	// 不带 includeSubDomains：同主域其他子站未必启用 HTTPS，避免误伤。
+	if clientScheme(r) == "https" {
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+	}
 	switch {
 	case p == "/healthz":
 		writeJSON(w, 200, map[string]any{"ok": true, "ts": time.Now().UnixMilli()})
@@ -2811,11 +2832,22 @@ func handleMkdir(w http.ResponseWriter, r *http.Request, root string) {
 // decodeStrict 严格 JSON 解码：语法错误或含未知字段都报错。
 // 避免手写 API 时字段名拼错被静默忽略（如把 expireSeconds 写成
 // expireHours，过期时间丢失、链接静默变成永久有效）。
+//
+// 解析细节只记服务端日志；对外统一返回固定文案——原始解析错误
+// （json: cannot unmarshal ... 等）会向客户端暴露后端语言与内部
+// 结构体定义，属于信息泄露。
 func decodeStrict(r *http.Request, v any) error {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
-	return dec.Decode(v)
+	if err := dec.Decode(v); err != nil {
+		log.Printf("[参数] 请求体解析失败（%s %s）: %v", r.Method, r.URL.Path, err)
+		return errBadBody
+	}
+	return nil
 }
+
+// errBadBody 请求体解析失败时对客户端返回的统一文案
+var errBadBody = errors.New("请求体格式错误")
 
 func handleUpload(w http.ResponseWriter, r *http.Request, root string) {
 	relParam := r.URL.Query().Get("path")
