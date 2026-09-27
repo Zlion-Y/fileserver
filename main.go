@@ -4046,6 +4046,13 @@ func davMove(w http.ResponseWriter, r *http.Request, root, rel string) {
 		w.WriteHeader(400)
 		return
 	}
+	// 目标的父目录可能尚不存在（realPathInside 对不存在的路径放行，挡不住
+	// symlink 逃逸）：与网页端 /api/move 一致，用 ensureCreatableInside
+	// 校验已存在祖先，防止 rename 经 root 内的符号链接目录落到 root 外
+	if !ensureCreatableInside(root, filepath.Dir(toAbs)) {
+		w.WriteHeader(403)
+		return
+	}
 	if fromAbs == root || toAbs == root {
 		w.WriteHeader(403)
 		return
