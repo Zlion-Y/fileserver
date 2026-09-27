@@ -1650,7 +1650,7 @@ const (
 	banDurationMs = 15 * 60 * 1000 // 封禁时长：15 分钟
 )
 
-// clientIP 取真实来源 IP（反代模式下优先 X-Forwarded-For）
+// clientIP 取真实来源 IP（反代模式下优先 X-Real-IP，其次 XFF 末段）
 func clientIP(r *http.Request) string {
 	host := r.RemoteAddr
 	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
@@ -1660,8 +1660,19 @@ func clientIP(r *http.Request) string {
 	// （即确实处在反向代理之后）才采信，否则端口直接暴露在公网时
 	// 伪造 XFF 就能绕过防爆破并污染访问日志。
 	if flagProxy && isTrustedProxyPeer(host) {
+		// 优先取可信反代覆盖设置的 X-Real-IP（deploy/nginx.conf 有配）
+		if h := r.Header.Get("X-Real-IP"); h != "" {
+			if ip := net.ParseIP(strings.TrimSpace(h)); ip != nil {
+				return ip.String()
+			}
+		}
+		// XFF 是追加式链：首段是客户端可任意伪造的（每次请求换个假 IP
+		// 就能绕开按 IP 记账的防爆破），真实来源是可信代理自己追加的末段
 		if h := r.Header.Get("X-Forwarded-For"); h != "" {
-			return strings.TrimSpace(strings.Split(h, ",")[0])
+			parts := strings.Split(h, ",")
+			if ip := net.ParseIP(strings.TrimSpace(parts[len(parts)-1])); ip != nil {
+				return ip.String()
+			}
 		}
 	}
 	return host
@@ -2271,7 +2282,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 			Enabled *bool `json:"enabled"`
 			Hours   int   `json:"hours"`
 		}
-		if err := decodeStrict(r, &body); err != nil {
+		if err := decodeStrict(w, r, &body); err != nil {
 			writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
 			return
 		}
@@ -2348,7 +2359,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Key string `json:"key"`
 		}
-		if err := decodeStrict(r, &body); err != nil {
+		if err := decodeStrict(w, r, &body); err != nil {
 			writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
 			return
 		}
@@ -2371,7 +2382,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			To string `json:"to"` // 可选：指定目标版本（如 v1.0.4），空 = 最新
 		}
-		if err := decodeStrict(r, &body); err != nil {
+		if err := decodeStrict(w, r, &body); err != nil {
 			writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
 			return
 		}
@@ -2431,7 +2442,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			RootDir string `json:"rootDir"`
 		}
-		if err := decodeStrict(r, &body); err != nil {
+		if err := decodeStrict(w, r, &body); err != nil {
 			writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
 			return
 		}
@@ -2804,7 +2815,7 @@ func handleMkdir(w http.ResponseWriter, r *http.Request, root string) {
 	var body struct {
 		Name string `json:"name"`
 	}
-	if err := decodeStrict(r, &body); err != nil {
+	if err := decodeStrict(w, r, &body); err != nil {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
 		return
 	}
@@ -2836,8 +2847,11 @@ func handleMkdir(w http.ResponseWriter, r *http.Request, root string) {
 // 解析细节只记服务端日志；对外统一返回固定文案——原始解析错误
 // （json: cannot unmarshal ... 等）会向客户端暴露后端语言与内部
 // 结构体定义，属于信息泄露。
-func decodeStrict(r *http.Request, v any) error {
-	dec := json.NewDecoder(r.Body)
+//
+// 请求体套 MaxBytesReader 封顶 1 MiB：/api/login 在认证前就可达，
+// 不限的话客户端可流式灌入超大 JSON 把内存吃爆。
+func decodeStrict(w http.ResponseWriter, r *http.Request, v any) error {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		log.Printf("[参数] 请求体解析失败（%s %s）: %v", r.Method, r.URL.Path, err)
@@ -2978,7 +2992,7 @@ func handleUploadInit(w http.ResponseWriter, r *http.Request, root string) {
 		Name string `json:"name"`
 		Size int64  `json:"size"`
 	}
-	if err := decodeStrict(r, &body); err != nil {
+	if err := decodeStrict(w, r, &body); err != nil {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
 		return
 	}
@@ -3403,7 +3417,7 @@ func handleZipDownload(w http.ResponseWriter, r *http.Request, root string) {
 	var body struct {
 		Paths []string `json:"paths"`
 	}
-	if err := decodeStrict(r, &body); err != nil {
+	if err := decodeStrict(w, r, &body); err != nil {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
 		return
 	}
@@ -3444,7 +3458,7 @@ func handleTrashRestore(w http.ResponseWriter, r *http.Request, root string) {
 	var body struct {
 		Name string `json:"name"`
 	}
-	if err := decodeStrict(r, &body); err != nil || strings.TrimSpace(body.Name) == "" {
+	if err := decodeStrict(w, r, &body); err != nil || strings.TrimSpace(body.Name) == "" {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误"})
 		return
 	}
@@ -3471,7 +3485,7 @@ func handleTrashPurge(w http.ResponseWriter, r *http.Request, root string, clear
 	var body struct {
 		Name string `json:"name"`
 	}
-	if err := decodeStrict(r, &body); err != nil || strings.TrimSpace(body.Name) == "" {
+	if err := decodeStrict(w, r, &body); err != nil || strings.TrimSpace(body.Name) == "" {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误"})
 		return
 	}
@@ -3488,7 +3502,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		User string `json:"user"`
 		Pass string `json:"pass"`
 	}
-	if err := decodeStrict(r, &body); err != nil {
+	if err := decodeStrict(w, r, &body); err != nil {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
 		return
 	}
@@ -3525,7 +3539,7 @@ func handleMove(w http.ResponseWriter, r *http.Request, root string) {
 		From string `json:"from"`
 		To   string `json:"to"`
 	}
-	if err := decodeStrict(r, &body); err != nil {
+	if err := decodeStrict(w, r, &body); err != nil {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
 		return
 	}
@@ -4224,7 +4238,7 @@ func handleShareCreate(w http.ResponseWriter, r *http.Request, root string) {
 		Alias         string `json:"alias"`    // 可选：自定义链接别名
 		Hotlink       bool   `json:"hotlink"`  // 可选：防盗链
 	}
-	if err := decodeStrict(r, &body); err != nil {
+	if err := decodeStrict(w, r, &body); err != nil {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
 		return
 	}
@@ -4370,7 +4384,7 @@ func handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 		Alias     *string `json:"alias"`     // 可选：null = 不修改；"" = 清除别名
 		Hotlink   *bool   `json:"hotlink"`   // 可选：null = 不修改
 	}
-	if err := decodeStrict(r, &body); err != nil {
+	if err := decodeStrict(w, r, &body); err != nil {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
 		return
 	}
@@ -4470,7 +4484,7 @@ func handleSessionKick(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ID string `json:"id"`
 	}
-	if err := decodeStrict(r, &body); err != nil || strings.TrimSpace(body.ID) == "" {
+	if err := decodeStrict(w, r, &body); err != nil || strings.TrimSpace(body.ID) == "" {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误"})
 		return
 	}
@@ -4508,7 +4522,7 @@ func handlePasswordChange(w http.ResponseWriter, r *http.Request) {
 		OldPass string `json:"oldPass"`
 		NewPass string `json:"newPass"`
 	}
-	if err := decodeStrict(r, &body); err != nil {
+	if err := decodeStrict(w, r, &body); err != nil {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
 		return
 	}
@@ -5357,6 +5371,9 @@ func main() {
 		Addr:              addr,
 		Handler:           http.HandlerFunc(handler),
 		ReadHeaderTimeout: 30 * time.Second,
+		// 只加 IdleTimeout 收闲连接；不设 WriteTimeout——
+		// 大文件下载是长流式响应，设了会把慢速下载掐断
+		IdleTimeout: 120 * time.Second,
 	}
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
