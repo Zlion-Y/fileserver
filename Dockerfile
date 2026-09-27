@@ -4,7 +4,7 @@ WORKDIR /src
 # 传 --build-arg VERSION=v1.2.3 注入真实版本号；默认 dev 为非发布版本，
 # 网页会显示「非发布版本」并禁用一键更新（容器里替换二进制 + 重启没有意义）
 ARG VERSION=dev
-COPY go.mod main.go ./
+COPY go.mod main.go disk_unix.go disk_windows.go ./
 COPY public ./public
 RUN CGO_ENABLED=0 go build -trimpath \
     -ldflags "-s -w -X main.version=${VERSION} -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
