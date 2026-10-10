@@ -91,15 +91,22 @@ func TestRealPathInsideSymlinkEscape(t *testing.T) {
 	if err := os.Symlink(secretDir, filepath.Join(root, "link")); err != nil {
 		t.Fatal(err)
 	}
-	// 已存在且越界的 symlink：必须拒绝
+	// 不存在的路径：realPathInside 放行（新建场景，由 ensureCreatableInside 兜底）
+	if !realPathInside(root, filepath.Join(root, "link", "new.txt")) {
+		t.Fatal("不存在的新路径应放行")
+	}
+	// 已存在且真实位于 root 外（经由 root 内 symlink）：必须拒绝
+	if err := os.WriteFile(filepath.Join(secretDir, "x.txt"), []byte("s"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if realPathInside(root, filepath.Join(root, "link", "x.txt")) {
-		t.Fatal("root 内 symlink 指向外部目录，realPathInside 应拒绝")
+		t.Fatal("root 内 symlink 指向外部目录，realPathInside 应拒绝已存在的越界路径")
 	}
 	// root 自身：放行
 	if !realPathInside(root, root) {
 		t.Fatal("root 自身应放行")
 	}
-	// 不存在的普通新路径：放行（新建场景）
+	// 不存在的普通新路径：放行
 	if !realPathInside(root, filepath.Join(root, "newdir", "x.txt")) {
 		t.Fatal("不存在的新路径应放行")
 	}
@@ -256,7 +263,7 @@ func TestSanitizeName(t *testing.T) {
 		in, want string
 	}{
 		{"a/b.txt", "b.txt"},
-		{`..\x.txt`, "x.txt"},
+		{"../x.txt", "x.txt"}, // ../ 前缀经 FromSlash+Base 剥离，各平台一致
 		{"normal.txt", "normal.txt"},
 		{"con.txt", "_con.txt"},
 		{"CON", "_CON"},
