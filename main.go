@@ -13,6 +13,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -35,6 +36,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -72,7 +74,7 @@ var (
 
 // 注意：必须是 var 而非 const，否则 -ldflags "-X main.version=..." 注入不会生效
 var (
-	version   = "1.3.4"
+	version   = "1.4.5"
 	commit    = "unknown" // 构建时由 -ldflags 注入
 	buildTime = "unknown"
 	// changelogB64 当前版本更新日志（base64）。CI 构建时把上一 tag 到本 tag 的
@@ -178,17 +180,20 @@ func isReleaseVersion() bool {
 	return true
 }
 
-// checkLatestRelease 查 GitHub 最新 Release（带缓存；服务端代理，规避浏览器跨域）
+// checkLatestRelease 查 GitHub 最新 Release（带缓存；服务端代理，规避浏览器跨域）。
+// HTTP 请求在锁外完成：锁内发 6s 超时的请求会让并发「检查更新」串行阻塞
 func checkLatestRelease(force bool) (*ghRelease, error) {
 	updMu.Lock()
-	defer updMu.Unlock()
 	now := time.Now().UnixMilli()
 	if !force && updCheckedAt > 0 && now-updCheckedAt < updateCacheTTL {
 		// 返回副本而非 &updCache：调用方在锁外读 TagName/Body/HTMLURL，
 		// 直接交出全局指针会与并发 force 查询的 updCache = rel 赋值竞争
 		snapshot := updCache
+		updMu.Unlock()
 		return &snapshot, nil
 	}
+	updMu.Unlock()
+
 	req, err := http.NewRequest("GET",
 		fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", updateRepo), nil)
 	if err != nil {
@@ -211,8 +216,10 @@ func checkLatestRelease(force bool) (*ghRelease, error) {
 	if rel.TagName == "" {
 		return nil, errors.New("GitHub 未返回版本号")
 	}
+	updMu.Lock()
 	updCache = rel
-	updCheckedAt = now
+	updCheckedAt = time.Now().UnixMilli()
+	updMu.Unlock()
 	return &rel, nil
 }
 
@@ -260,17 +267,20 @@ func versionJSON(forceCheck bool) map[string]any {
 // 因此这里会在缺内容时用两个版本之间的提交记录补全。
 func releaseNotesOf(tag string) (string, error) {
 	notesMu.Lock()
-	defer notesMu.Unlock()
 	if v, ok := notesCache[tag]; ok {
+		notesMu.Unlock()
 		return v, nil
 	}
+	notesMu.Unlock() // HTTP 在锁外（同 checkLatestRelease），并发查询不串行阻塞
 	var rel ghRelease
 	if err := ghGetJSON(fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s",
 		updateRepo, url.PathEscape(tag)), &rel); err != nil {
 		return "", err
 	}
 	notes := enrichNotes(tag, rel.Body)
+	notesMu.Lock()
 	notesCache[tag] = notes
+	notesMu.Unlock()
 	return notes, nil
 }
 
@@ -493,7 +503,8 @@ func goarmVersion() string {
 // downloadToFile 流式下载并校验（大小下限 + 可执行文件魔数）。
 // onProg 定期上报 (已下载, 总量)；cancelled 返回 true 时中止并删除半成品文件。
 func downloadToFile(url, dest string, onProg func(done, total int64), cancelled func() bool) error {
-	client := &http.Client{Timeout: 5 * time.Minute}
+	// 30 分钟总时长上限：5 分钟对慢链路上的大体积二进制偏短，中途必然失败
+	client := &http.Client{Timeout: 30 * time.Minute}
 	resp, err := client.Get(url)
 	if err != nil {
 		return fmt.Errorf("无法连接 GitHub: %w", err)
@@ -552,8 +563,14 @@ func downloadToFile(url, dest string, onProg func(done, total int64), cancelled 
 	return validateBinary(dest, done)
 }
 
-// validateBinary 校验候选二进制：大小下限 + 可执行文件魔数，失败即删除
+// validateBinary 校验候选二进制：大小下限 + 可执行文件魔数，失败即删除。
+// size 是实际收到的字节数：一个 "MZ" 开头的几 KB 小文件也过得了魔数检查，
+// 却足以把正在运行的服务覆盖成起不来的垃圾，必须用大小下限再拦一道
 func validateBinary(path string, size int64) error {
+	if size > 0 && size < 1<<20 {
+		os.Remove(path)
+		return errors.New("文件过小（不足 1MB），不可能是完整的程序二进制，已取消替换")
+	}
 	head := make([]byte, 2)
 	if hf, err := os.Open(path); err == nil {
 		_, _ = io.ReadFull(hf, head)
@@ -605,10 +622,25 @@ func scheduleRestart() {
 				}
 			}
 			if exe, err := os.Executable(); err == nil {
-				_ = syscall.Exec(exe, os.Args, os.Environ())
+				// rename 替换二进制后 /proc/self/exe 会变成 "… (deleted)"，
+				// 原样 exec 必然 ENOENT；剥掉后缀才能指向新文件
+				if strings.HasSuffix(exe, " (deleted)") {
+					exe = strings.TrimSuffix(exe, " (deleted)")
+				}
+				// exec 失败必须如实上报：吞掉错误后无条件报「完成」，
+				// 实际进程还跑在旧二进制上，用户会被假状态误导
+				if errno := syscall.Exec(exe, os.Args, os.Environ()); errno != nil {
+					setUpd("error", "重启失败（"+errno.Error()+"），二进制已替换，请手动重启服务进程")
+					return
+				}
+			} else {
+				setUpd("error", "重启失败（无法获取程序路径），二进制已替换，请手动重启服务进程")
+				return
 			}
 		}
 		setUpd("done", "二进制已更新，Windows 请手动重启服务进程")
+		// 没有真正重启（Windows/手动路径）：释放忙碌标志，允许再次发起更新
+		atomic.StoreInt32(&updBusy, 0)
 	}()
 }
 
@@ -708,6 +740,9 @@ func handleSelfUpdateUpload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "已有更新任务在进行中（" + s + "）"})
 		return
 	}
+	// 成功路径（scheduleRestart 后进程未退出/重启失败）也要释放忙碌标志，
+	// 否则之后所有 selfupdate 请求永久 409
+	defer atomic.StoreInt32(&updBusy, 0)
 	fail := func(code int, msg string) {
 		atomic.StoreInt32(&updBusy, 0)
 		setUpd("idle", "")
@@ -865,10 +900,55 @@ func dataPath(name string) string {
 	os.MkdirAll(flagDataDir, 0o755)
 	return filepath.Join(flagDataDir, name)
 }
+
+// atomicWriteFile 临时文件 + fsync + rename 的原子落盘：
+// 没有 Sync 的话断电后 rename 出来的可能是 0 长度文件；写失败必须暴露给调用方，
+// 静默丢弃会让管理员收到「已保存」的假成功（磁盘满/只读时配置实际回退了）
+func atomicWriteFile(path string, b []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// backupCorrupt 把损坏的数据文件改名留证（.corrupt-<时间戳>），
+// 避免下一次 saveShares 把可手工抢救的原始数据静默覆盖掉
+func backupCorrupt(path string) {
+	bak := fmt.Sprintf("%s.corrupt-%s", path, time.Now().Format("20060102-150405"))
+	if err := os.Rename(path, bak); err == nil {
+		log.Printf("[持久化] %s 解析失败，已改名保留为 %s，请手工检查后恢复", path, bak)
+	}
+}
+
 func loadConfig() {
 	b, err := os.ReadFile(dataPath("config.json"))
-	if err == nil {
-		_ = json.Unmarshal(b, &cfg)
+	if err != nil {
+		return
+	}
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		// 损坏即静默清空 = 管理员被锁在外面（rootDir/密码哈希丢失），必须留证
+		log.Printf("[持久化] config.json 解析失败（%v），沿用默认配置", err)
+		backupCorrupt(dataPath("config.json"))
 	}
 }
 func saveConfig() {
@@ -876,12 +956,15 @@ func saveConfig() {
 	// 与 POST /api/config 等写操作并发构成数据竞争（go test -race 可复现）；
 	// 若写盘放在锁外，两个并发保存者还会互相覆盖（旧快照后写，丢更新）。
 	cfgMu.Lock()
-	b, _ := json.MarshalIndent(cfg, "", "  ")
-	// 0600：config.json 里有管理密码哈希，任何备份/协作者都不应默认可读
-	tmp := dataPath("config.json") + ".tmp"
-	_ = os.WriteFile(tmp, b, 0o600)
-	_ = os.Rename(tmp, dataPath("config.json"))
-	cfgMu.Unlock()
+	defer cfgMu.Unlock()
+	b, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		log.Printf("[持久化] config 序列化失败: %v", err)
+		return
+	}
+	if err := atomicWriteFile(dataPath("config.json"), b, 0o600); err != nil {
+		log.Printf("[持久化] config.json 写盘失败，本次修改可能未保存: %v", err)
+	}
 }
 func loadShares() {
 	b, err := os.ReadFile(dataPath("shares.json"))
@@ -889,16 +972,21 @@ func loadShares() {
 		return
 	}
 	var m map[string]*Share
-	if json.Unmarshal(b, &m) == nil && m != nil {
-		// 手工编辑/损坏的 shares.json 可能出现 "token": null，
-		// 任何后续遍历（publicOne/runTidy/moveShareSync）解引用都会 panic，这里直接剔除
-		for k, s := range m {
-			if s == nil {
-				delete(m, k)
-			}
-		}
-		shares = m
+	if err := json.Unmarshal(b, &m); err != nil || m == nil {
+		// 解析失败继续往下走 = 内存空表，下一次任意保存会把全部分享
+		// （含密码与访问日志）清零。必须留证并终止加载
+		log.Printf("[持久化] shares.json 解析失败（%v），加载 0 条分享", err)
+		backupCorrupt(dataPath("shares.json"))
+		return
 	}
+	// 手工编辑/损坏的 shares.json 可能出现 "token": null，
+	// 任何后续遍历（publicOne/runTidy/moveShareSync）解引用都会 panic，这里直接剔除
+	for k, s := range m {
+		if s == nil {
+			delete(m, k)
+		}
+	}
+	shares = m
 	// 迁移：把 v1.0.15 及以前遗留的明文密码转成加密存储，并按需解密回内存
 	migrated := false
 	for _, s := range shares {
@@ -926,14 +1014,19 @@ func loadShares() {
 	}
 }
 func saveShares() {
-	tmp := dataPath("shares.json") + ".tmp"
 	// 全程持锁：如果在 Marshal 之后才释放锁又重新取快照，并发修改会被后写者覆盖丢失。
 	// 注意所有调用点都必须先 Unlock 才能调用本函数（Go 互斥锁不可重入）
 	shareMu.Lock()
-	b, _ := json.MarshalIndent(shares, "", "  ")
+	b, err := json.MarshalIndent(shares, "", "  ")
+	if err != nil {
+		shareMu.Unlock()
+		log.Printf("[持久化] shares 序列化失败: %v", err)
+		return
+	}
 	// 0600：shares.json 含加密后的分享密码与访问日志，不应默认全局可读
-	_ = os.WriteFile(tmp, b, 0o600)
-	_ = os.Rename(tmp, dataPath("shares.json"))
+	if err := atomicWriteFile(dataPath("shares.json"), b, 0o600); err != nil {
+		log.Printf("[持久化] shares.json 写盘失败，分享数据可能未保存: %v", err)
+	}
 	shareMu.Unlock()
 }
 
@@ -943,6 +1036,14 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	_, _ = w.Write(b)
+}
+
+// fsErr 文件系统错误统一脱敏：os.Rename/Open 等的原始错误串包含服务器
+// 绝对路径（root 下 .trash 等），直接回传客户端属于信息泄露。
+// 细节进服务端日志，对客户端给固定文案
+func fsErr(scope string, err error) string {
+	log.Printf("[fs] %s: %v", scope, err)
+	return "服务器文件操作失败，详情请查看服务端日志"
 }
 func getRoot() (string, error) {
 	cfgMu.Lock()
@@ -956,11 +1057,52 @@ func getRoot() (string, error) {
 	}
 	return abs, nil
 }
+
+// absEqual / absPrefix 大小写不敏感文件系统上的绝对路径等价与前缀判定：
+// Windows 上仅改变大小写的父目录改名会让字符串前缀匹配失配
+func absEqual(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		return strings.EqualFold(a, b)
+	}
+	return false
+}
+
+func absPrefix(parent, child string) bool {
+	p := parent + string(filepath.Separator)
+	if strings.HasPrefix(child, p) {
+		return true
+	}
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		return strings.HasPrefix(strings.ToLower(child), strings.ToLower(p))
+	}
+	return false
+}
+
+// pathWithin 判断 child 是否等于或位于 root 之内。
+// 旧的字符串前缀判定 root+sep 在 root 为盘符根（C:\、/）时拼出双分隔符，
+// 任何子路径都判不进 —— 整盘共享场景下所有请求被误拒
+func pathWithin(root, child string) bool {
+	if root == child {
+		return true
+	}
+	trimmed := strings.TrimSuffix(root, string(filepath.Separator))
+	if trimmed == "" { // Unix 根目录 "/"
+		return true
+	}
+	return strings.HasPrefix(child, trimmed+string(filepath.Separator))
+}
+
 func safeJoin(root, rel string) (string, error) {
 	clean := strings.TrimPrefix(filepath.FromSlash(rel), string(filepath.Separator))
 	rootAbs, _ := filepath.Abs(root)
 	target, _ := filepath.Abs(filepath.Join(rootAbs, clean))
-	if target != rootAbs && !strings.HasPrefix(target, rootAbs+string(filepath.Separator)) {
+	// 用 filepath.Rel 做包含性判定：对盘符根、根目录等边界一致成立，
+	// 且天然拒绝 "../" 逃逸（Rel 结果以 .. 开头即出界）
+	relPath, err := filepath.Rel(rootAbs, target)
+	if err != nil || relPath == ".." || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) {
 		return "", errors.New("非法路径")
 	}
 	return target, nil
@@ -979,13 +1121,15 @@ func realPathInside(root, target string) bool {
 	}
 	tReal, err := filepath.EvalSymlinks(target)
 	if err != nil {
-		// 目标不存在或无法解析：后续 os.Stat/os.Create 自会失败，无需在此拦截
-		return true
-	}
-	if tReal != rootReal && !strings.HasPrefix(tReal, rootReal+string(filepath.Separator)) {
+		// 区分「不存在」与「无法解析」：不存在放行（新建场景，后续创建流程兜底）；
+		// ELOOP/EACCES 等无法解析的错误安全优先拒绝 —— 旧的 fail-open 会让
+		// root 内越界链接绕过包含性校验
+		if _, stErr := os.Lstat(target); stErr != nil && os.IsNotExist(stErr) {
+			return true
+		}
 		return false
 	}
-	return true
+	return pathWithin(rootReal, tReal)
 }
 
 // ensureCreatableInside 「新建」路径的符号链接兜底。
@@ -998,7 +1142,6 @@ func ensureCreatableInside(root, target string) bool {
 	if err != nil {
 		return false
 	}
-	sep := string(filepath.Separator)
 	p := target
 	for i := 0; i < 256; i++ {
 		if _, err := os.Lstat(p); err == nil {
@@ -1006,7 +1149,7 @@ func ensureCreatableInside(root, target string) bool {
 			if err != nil {
 				return false // 悬空链接等无法解析的情况：安全优先，拒绝
 			}
-			return real == rootReal || strings.HasPrefix(real, rootReal+sep)
+			return pathWithin(rootReal, real)
 		}
 		parent := filepath.Dir(p)
 		if parent == p {
@@ -1085,10 +1228,12 @@ func moveToTrash(root, target string) (string, error) {
 	if err := os.Rename(target, filepath.Join(tdir, entry)); err != nil {
 		return "", err
 	}
-	// 旁挂元数据：记录原始相对路径，供「恢复」用；失败不阻断删除
+	// 旁挂元数据：记录原始相对路径，供「恢复」用；失败不阻断删除但必须留痕
 	rel := filepath.ToSlash(strings.TrimPrefix(strings.TrimPrefix(target, root), string(filepath.Separator)))
 	meta, _ := json.Marshal(map[string]any{"orig": rel, "at": time.Now().UnixMilli()})
-	_ = os.WriteFile(filepath.Join(tdir, entry+".meta.json"), meta, 0o600)
+	if err := os.WriteFile(filepath.Join(tdir, entry+".meta.json"), meta, 0o600); err != nil {
+		log.Printf("[回收站] 元数据写入失败（%s），恢复时原路径将退化为条目名: %v", entry, err)
+	}
 	return entry, nil
 }
 
@@ -1115,7 +1260,15 @@ func trashList(root string) []trashEntry {
 		if err != nil {
 			continue
 		}
-		e := trashEntry{Name: name, IsDir: it.IsDir(), Deleted: info.ModTime().UnixMilli()}
+		e := trashEntry{Name: name, IsDir: it.IsDir()}
+		// 删除时间取文件名前缀的时间戳 —— 与 trashSweep 的过期判定同一口径。
+		// 旧的用内容 mtime（rename 保留的是文件原修改时间），列表排序和
+		// 「剩余天数」与实际清扫时间对不上
+		if t, perr := time.ParseInLocation("20060102-150405", strings.SplitN(name, "_", 2)[0], time.Local); perr == nil {
+			e.Deleted = t.UnixMilli()
+		} else {
+			e.Deleted = info.ModTime().UnixMilli()
+		}
 		if !it.IsDir() {
 			e.Size = info.Size()
 		}
@@ -1148,6 +1301,11 @@ func trashOrigFromName(entry string) string {
 	// 旧序号是纯数字，旧原名几乎不会恰好是 4 位 hex；优先新格式解读
 	rest := parts[1:]
 	if len(rest) >= 2 && isHex4(rest[0]) {
+		// 冲突重试的新格式「时间戳_随机码_序号_原名」要跳过中间的序号段，
+		// 否则恢复出的文件名会多出 "1_" 前缀
+		if len(rest) >= 3 && isAllDigits(rest[1]) {
+			return strings.Join(rest[2:], "_")
+		}
 		return strings.Join(rest[1:], "_")
 	}
 	// 旧格式：余下全部（序号_原名 或 原名含下划线的情形）——序号无法与
@@ -1209,7 +1367,14 @@ func trashRestore(root, entry string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	_ = os.MkdirAll(filepath.Dir(dst), 0o755)
+	// 回收站内容可能恢复进「root 内 symlink 指向的外部目录」：与上传/移动
+	// 同一威胁模型，必须走 ensureCreatableInside 校验已存在祖先
+	if !ensureCreatableInside(root, dst) {
+		return "", errors.New("原路径不合法")
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return "", fmt.Errorf("创建原目录失败: %w", err)
+	}
 	// 目标被占用 → 同名自动加后缀，与上传一致
 	if _, err := os.Lstat(dst); err == nil {
 		ext := filepath.Ext(dst)
@@ -1272,6 +1437,16 @@ func trashSweep(root string) int {
 	}
 	return removed
 }
+
+// reservedName 是否为系统保留名（回收站目录名）。大小写不敏感文件系统上
+// .TRASH 与 .trash 是同一个目录，上传名为 .TRASH 的文件同样会瘫痪删除功能
+func reservedName(name string) bool {
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		return strings.EqualFold(name, trashDirName)
+	}
+	return name == trashDirName
+}
+
 func sanitizeName(name string) string {
 	name = filepath.Base(filepath.FromSlash(name))
 	name = strings.Map(func(r rune) rune {
@@ -1623,8 +1798,20 @@ func clientScheme(r *http.Request) string {
 }
 func clientHost(r *http.Request) string {
 	if flagProxy {
-		if h := r.Header.Get("X-Forwarded-Host"); h != "" {
-			return strings.TrimSpace(strings.Split(h, ",")[0])
+		// 与 clientIP 同一信任模型：仅当直连来源本身是可信代理时才采信
+		// 转发头，否则任何人都能用 X-Forwarded-Host 把钓鱼域名拼进分享链接
+		host := r.RemoteAddr
+		if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			host = h
+		}
+		if isTrustedProxyPeer(host) {
+			if h := r.Header.Get("X-Forwarded-Host"); h != "" {
+				h = strings.TrimSpace(strings.Split(h, ",")[0])
+				// host 会原样拼进 URL，含分隔符/空白即可注入，一律拒收
+				if h != "" && !strings.ContainsAny(h, " \t/\\?#@") {
+					return h
+				}
+			}
 		}
 	}
 	return r.Host
@@ -1774,13 +1961,26 @@ func loadSessions() {
 		return
 	}
 	var m map[string]*sessInfo
-	if json.Unmarshal(b, &m) == nil && m != nil {
-		sessions = m
+	if err := json.Unmarshal(b, &m); err != nil || m == nil {
+		log.Printf("[持久化] sessions.json 解析失败（%v），忽略", err)
+		return
 	}
+	// "token": null 的条目在遍历时解引用会直接 panic（服务拒绝启动），
+	// 与 loadShares 同样在加载期剔除
+	for k, s := range m {
+		if s == nil {
+			delete(m, k)
+		}
+	}
+	sessions = m
 	// 清掉已过期的历史会话
 	now := time.Now().UnixMilli()
 	sessMu.Lock()
 	for k, s := range sessions {
+		if s == nil {
+			delete(sessions, k)
+			continue
+		}
 		if s.ExpiresAt > 0 && s.ExpiresAt < now {
 			delete(sessions, k)
 		}
@@ -1792,11 +1992,15 @@ func saveSessions() {
 	// 序列化与写盘必须都在锁内：若写盘在锁外，并发新会话时后完成的
 	// 旧快照会覆盖先落盘的新数据（与 saveShares 同类问题）
 	sessMu.Lock()
-	b, _ := json.MarshalIndent(sessions, "", "  ")
-	tmp := dataPath("sessions.json") + ".tmp"
-	_ = os.WriteFile(tmp, b, 0o600)
-	_ = os.Rename(tmp, dataPath("sessions.json"))
-	sessMu.Unlock()
+	defer sessMu.Unlock()
+	b, err := json.MarshalIndent(sessions, "", "  ")
+	if err != nil {
+		log.Printf("[持久化] sessions 序列化失败: %v", err)
+		return
+	}
+	if err := atomicWriteFile(dataPath("sessions.json"), b, 0o600); err != nil {
+		log.Printf("[持久化] sessions.json 写盘失败: %v", err)
+	}
 }
 
 func newSession(user, ip string) (token string, expMs int64) {
@@ -1813,7 +2017,10 @@ func validSession(token string) bool {
 	sessMu.Lock()
 	defer sessMu.Unlock()
 	s, ok := sessions[token]
-	if !ok {
+	if !ok || s == nil {
+		if ok {
+			delete(sessions, token)
+		}
 		return false
 	}
 	if s.ExpiresAt > 0 && s.ExpiresAt < time.Now().UnixMilli() {
@@ -1838,6 +2045,17 @@ func checkAuth(w http.ResponseWriter, r *http.Request) bool {
 	// WebDAV：必须鉴权（Basic 认证原生兼容各类客户端），失败时返回
 	// WWW-Authenticate 让客户端弹密码框（浏览器路径不带此头，由前端跳登录页）
 	if strings.HasPrefix(p, "/dav") {
+		// 与 /api 同一防爆破命名空间：旧的提前 return 让 /dav 完全绕过
+		// 封禁与失败计数，可以无限爆破密码（且每次失败都烧一轮 PBKDF2）
+		ip := clientIP(r)
+		if ms := banRemaining(ip); ms > 0 {
+			w.Header().Set("Retry-After", strconv.FormatInt(ms/1000+1, 10))
+			w.Header().Set("WWW-Authenticate", `Basic realm="fileserver", charset="UTF-8"`)
+			writeJSON(w, http.StatusTooManyRequests, map[string]any{
+				"error": fmt.Sprintf("失败次数过多，该 IP 已被临时封禁，请 %d 分钟后再试", ms/60000+1),
+			})
+			return false
+		}
 		if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" && validSession(c.Value) {
 			return true
 		}
@@ -1846,6 +2064,9 @@ func checkAuth(w http.ResponseWriter, r *http.Request) bool {
 			subtle.ConstantTimeCompare([]byte(u), []byte(flagUser)) == 1 &&
 			checkPass(pw) {
 			return true
+		}
+		if hasBasic {
+			recordAuthFail(ip)
 		}
 		w.Header().Set("WWW-Authenticate", `Basic realm="fileserver", charset="UTF-8"`)
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "WebDAV 需要登录（用户名/密码同管理端）"})
@@ -1933,6 +2154,39 @@ func rangeStartPositive(r *http.Request) bool {
 	}
 	start, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
 	return err == nil && start > 0
+}
+
+// rangeCoversToEnd 判断 Range 请求是否覆盖到文件末尾（即响应包含完整尾部内容）。
+// 无 Range 头视为覆盖；多段 Range 任一段覆盖末尾即视为覆盖
+func rangeCoversToEnd(r *http.Request, size int64) bool {
+	rg := r.Header.Get("Range")
+	if rg == "" {
+		return true
+	}
+	if size <= 0 {
+		return true
+	}
+	rg = strings.TrimPrefix(rg, "bytes=")
+	for _, part := range strings.Split(rg, ",") {
+		p := strings.SplitN(strings.TrimSpace(part), "-", 2)
+		if len(p) == 0 || strings.TrimSpace(p[0]) == "" {
+			continue
+		}
+		start, err := strconv.ParseInt(strings.TrimSpace(p[0]), 10, 64)
+		if err != nil {
+			continue
+		}
+		end := size - 1
+		if len(p) == 2 && strings.TrimSpace(p[1]) != "" {
+			if e, err2 := strconv.ParseInt(strings.TrimSpace(p[1]), 10, 64); err2 == nil {
+				end = e
+			}
+		}
+		if start <= size-1 && end >= size-1 {
+			return true
+		}
+	}
+	return false
 }
 
 // condRequestNotModified 判断条件请求是否「真的」会命中 304。
@@ -2142,28 +2396,8 @@ func mediaKindOf(name string) string {
 
 // ---------------- 路由 ----------------
 func handler(w http.ResponseWriter, r *http.Request) {
-	if !checkAuth(w, r) {
-		return
-	}
-	if flagLog {
-		defer func() {
-			log.Printf("%s %s %s", r.Method, r.URL.Path, r.RemoteAddr)
-		}()
-	}
-	p := r.URL.Path
-	// 上传大小限制：只作用于上传接口（不影响登录、自更新等接口的正常请求），
-	// 并用 MaxBytesReader 兜底 —— 仅靠 ContentLength 判断时，
-	// chunked 编码（ContentLength == -1）会让限制完全失效。
-	if r.Method == http.MethodPost && flagMaxMB > 0 && p == "/api/upload" {
-		limit := flagMaxMB*1024*1024 + uploadSlackBytes
-		if r.ContentLength > limit {
-			writeJSON(w, http.StatusRequestEntityTooLarge,
-				map[string]any{"error": fmt.Sprintf("上传内容超过 %dMB 限制", flagMaxMB)})
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, limit)
-	}
-	// 安全响应头：防止 MIME 嗅探、点击劫持、外链泄露 referrer
+	// 安全响应头必须在鉴权之前设置：401/429/413 这类错误响应同样
+	// 不能缺 nosniff/CSP/HSTS（旧实现先 checkAuth 后设头，错误响应全裸奔）
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "no-referrer")
@@ -2187,6 +2421,27 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	// 不带 includeSubDomains：同主域其他子站未必启用 HTTPS，避免误伤。
 	if clientScheme(r) == "https" {
 		w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+	}
+	if !checkAuth(w, r) {
+		return
+	}
+	if flagLog {
+		defer func() {
+			log.Printf("%s %s %s", r.Method, r.URL.Path, r.RemoteAddr)
+		}()
+	}
+	p := r.URL.Path
+	// 上传大小限制：只作用于上传接口（不影响登录、自更新等接口的正常请求），
+	// 并用 MaxBytesReader 兜底 —— 仅靠 ContentLength 判断时，
+	// chunked 编码（ContentLength == -1）会让限制完全失效。
+	if r.Method == http.MethodPost && flagMaxMB > 0 && p == "/api/upload" {
+		limit := flagMaxMB*1024*1024 + uploadSlackBytes
+		if r.ContentLength > limit {
+			writeJSON(w, http.StatusRequestEntityTooLarge,
+				map[string]any{"error": fmt.Sprintf("上传内容超过 %dMB 限制", flagMaxMB)})
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
 	}
 	switch {
 	case p == "/healthz":
@@ -2374,6 +2629,12 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 		saveConfig()
 		writeJSON(w, 200, map[string]any{"ok": true, "masked": maskKey(key)})
 	case p == "/api/selfupdate" && r.Method == http.MethodPost:
+		// 非发布版本（dev/容器构建）一律拒绝在线更新：容器里替换二进制
+		// 跑的是镜像外文件，重建即回滚，版本不可复现（与 Dockerfile 注释对齐）
+		if !isReleaseVersion() {
+			writeJSON(w, 400, map[string]any{"error": "当前为非发布版本（dev/容器构建），一键更新不可用，请通过镜像或重新构建升级"})
+			return
+		}
 		// multipart = 手动上传更新包（服务器连不上 GitHub 时的本地替代路径）
 		if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
 			handleSelfUpdateUpload(w, r)
@@ -2643,8 +2904,8 @@ func handleList(w http.ResponseWriter, r *http.Request, root string) {
 	items, err := os.ReadDir(dir)
 	if err != nil {
 		// 静默返回空列表会让人误以为目录是空的（进而执行删除/重建等危险操作），
-		// 必须把读取失败显式抛给前端
-		writeJSON(w, 500, map[string]any{"error": "读取目录失败: " + err.Error()})
+		// 必须把读取失败显式抛给前端（错误串脱敏，不回传绝对路径）
+		writeJSON(w, 500, map[string]any{"error": fsErr("读取目录 "+rel, err)})
 		return
 	}
 	entries := []map[string]any{}
@@ -2803,7 +3064,12 @@ func listApplyFilter(entries []map[string]any, filter, size string) []map[string
 }
 
 func handleMkdir(w http.ResponseWriter, r *http.Request, root string) {
-	dir, err := safeJoin(root, r.URL.Query().Get("path"))
+	relParam := r.URL.Query().Get("path")
+	if inTrashRel(relParam) {
+		writeJSON(w, 400, map[string]any{"error": "不能在回收站内创建目录"})
+		return
+	}
+	dir, err := safeJoin(root, relParam)
 	if err != nil {
 		writeJSON(w, 400, map[string]any{"error": err.Error()})
 		return
@@ -2824,7 +3090,7 @@ func handleMkdir(w http.ResponseWriter, r *http.Request, root string) {
 		writeJSON(w, 400, map[string]any{"error": "名称不能为空"})
 		return
 	}
-	if name == trashDirName {
+	if reservedName(name) {
 		writeJSON(w, 400, map[string]any{"error": "该名称为系统保留"})
 		return
 	}
@@ -2834,7 +3100,7 @@ func handleMkdir(w http.ResponseWriter, r *http.Request, root string) {
 		return
 	}
 	if err := os.MkdirAll(target, 0o755); err != nil {
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		writeJSON(w, 500, map[string]any{"error": fsErr("创建目录", err)})
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -2855,6 +3121,11 @@ func decodeStrict(w http.ResponseWriter, r *http.Request, v any) error {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		log.Printf("[参数] 请求体解析失败（%s %s）: %v", r.Method, r.URL.Path, err)
+		return errBadBody
+	}
+	// 只允许单个 JSON 值：{"a":1} 垃圾数据 / 拼接的第二个对象同样拒绝
+	if dec.More() {
+		log.Printf("[参数] 请求体含多余数据（%s %s）", r.Method, r.URL.Path)
 		return errBadBody
 	}
 	return nil
@@ -2920,6 +3191,15 @@ func handleUpload(w http.ResponseWriter, r *http.Request, root string) {
 			part.Close()
 			continue
 		}
+		// 上传名为 .trash 的文件会在 root 下生成普通文件，之后所有删除
+		// （API/WebDAV）rename 进「它」都会 500，删除功能整体瘫痪；
+		// 与 handleMkdir 的保留名检查对齐，必须在落盘前拒绝
+		if reservedName(sanitizeName(filename)) {
+			writeJSON(w, 400, map[string]any{
+				"ok": false, "files": saved, "failed": sanitizeName(filename),
+				"error": "该文件名为系统保留，不能使用"})
+			return
+		}
 		// 排他式保存：同名冲突（含并发上传）自动加 (1)/(2)… 后缀，
 		// 不再依赖「先 Stat 后 Create」的 uniquePath（存在 TOCTOU 覆盖窗口）
 		size, target, err := saveStreamExcl(dir, sanitizeName(filename), part, maxBytes)
@@ -2937,7 +3217,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request, root string) {
 			} else {
 				writeJSON(w, 500, map[string]any{
 					"ok": false, "files": saved, "failed": sanitizeName(filename),
-					"error": err.Error()})
+					"error": fsErr("保存上传文件", err)})
 			}
 			return
 		}
@@ -2996,8 +3276,10 @@ func handleUploadInit(w http.ResponseWriter, r *http.Request, root string) {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
 		return
 	}
-	if body.Size < 0 {
-		writeJSON(w, 400, map[string]any{"error": "size 不合法"})
+	if body.Size <= 0 {
+		// size=0 会让 complete 的长度校验（sess.Size>0 才比对）被跳过，
+		// 只传一片也能 200，静默产出截断文件；空文件走普通上传路径
+		writeJSON(w, 400, map[string]any{"error": "size 不合法（分片上传不支持空文件）"})
 		return
 	}
 	if flagMaxMB > 0 && body.Size > flagMaxMB*1024*1024 {
@@ -3027,6 +3309,10 @@ func handleUploadInit(w http.ResponseWriter, r *http.Request, root string) {
 		writeJSON(w, 400, map[string]any{"error": "文件名不能为空"})
 		return
 	}
+	if reservedName(name) {
+		writeJSON(w, 400, map[string]any{"error": "该文件名为系统保留，不能使用"})
+		return
+	}
 	// 顺带清理同目录里超过 TTL 的孤儿分片（崩溃/放弃上传遗留）
 	if items, err := os.ReadDir(dir); err == nil {
 		for _, it := range items {
@@ -3047,7 +3333,7 @@ func handleUploadInit(w http.ResponseWriter, r *http.Request, root string) {
 	part := filepath.Join(dir, uploadTempPrefix+id+uploadTempSuffix)
 	f, err := os.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		writeJSON(w, 500, map[string]any{"error": fsErr("创建分片文件", err)})
 		return
 	}
 	_ = f.Close()
@@ -3101,10 +3387,41 @@ func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return
 	}
-	n, err := io.Copy(f, io.LimitReader(r.Body, limit))
+	// 手动区分「读错误」（客户端断连）与「写错误」（磁盘满等）：
+	// 两者都不删会话——已写入的字节数推进 Received 后状态依然一致，
+	// 客户端从新偏移续传即可；只有「超限」这类终止性失败才整体作废。
+	// 旧的统一 fail() 会把几十 GB 断点续传进度直接清零
+	var n int64
+	var readErr, writeErr error
+	{
+		lr := io.LimitReader(r.Body, limit)
+		buf := make([]byte, 64<<10)
+		for {
+			nr, er := lr.Read(buf)
+			if nr > 0 {
+				nw, ew := f.Write(buf[:nr])
+				n += int64(nw) // 部分写入时只累计实际落盘的字节数
+				if ew != nil {
+					writeErr = ew
+					break
+				}
+				if nw != nr {
+					writeErr = io.ErrShortWrite
+					break
+				}
+			}
+			if er == io.EOF {
+				break
+			}
+			if er != nil {
+				readErr = er
+				break
+			}
+		}
+	}
 	closeErr := f.Close()
-	// 终止性失败（超限/写坏）：字节已追加进分片文件，Received 与文件大小从此错位，
-	// 必须整体作废（删文件+删会话），客户端从头重传，绝不能带病续传
+	// 终止性失败（单片超限/总量超限）：字节已追加进分片文件，Received 与
+	// 文件大小从此错位，必须整体作废（删文件+删会话），绝不能带病续传
 	fail := func(code int, msg string) {
 		_ = os.Remove(part)
 		upSessMu.Lock()
@@ -3112,8 +3429,24 @@ func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 		upSessMu.Unlock()
 		writeJSON(w, code, map[string]any{"error": msg, "code": "ABORTED"})
 	}
-	if err != nil || closeErr != nil {
+	if closeErr != nil {
+		// Close 失败时缓冲区数据是否落盘未知，只能作废
 		fail(500, "分片写入失败")
+		return
+	}
+	if writeErr != nil {
+		sess.Received += n
+		log.Printf("[上传] 分片写入中断（%s @ %d）: %v", sess.Name, sess.Received, writeErr)
+		writeJSON(w, http.StatusInsufficientStorage, map[string]any{
+			"error": "写入失败（磁盘满或权限问题），已保留已传进度", "received": sess.Received})
+		return
+	}
+	if readErr != nil {
+		// 客户端断连：保留分片与会话，进度照常累计，重连后从 Received 续传
+		sess.Received += n
+		sess.LastActive = time.Now()
+		writeJSON(w, http.StatusRequestTimeout, map[string]any{
+			"error": "连接中断，已保留上传进度", "received": sess.Received})
 		return
 	}
 	if n == uploadChunkMax+1 {
@@ -3176,11 +3509,11 @@ func handleUploadComplete(w http.ResponseWriter, r *http.Request, root string) {
 	// 最终名占用（含并发完成）时与普通上传一致加 (1)(2) 后缀
 	final, err := exclusiveName(sess.Dir, sess.Name)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		writeJSON(w, 500, map[string]any{"error": fsErr("分配最终文件名", err)})
 		return
 	}
 	if err := os.Rename(part, final); err != nil {
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		writeJSON(w, 500, map[string]any{"error": fsErr("分片改名", err)})
 		return
 	}
 	upSessMu.Lock()
@@ -3219,7 +3552,12 @@ func handleUploadStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]any{"error": "上传会话不存在", "code": "NO_SESSION"})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "received": sess.Received, "size": sess.Size})
+	// Received 由分片追加在 sess.mu 内改写，这里必须持同一把锁读快照，
+	// 否则与并发分片写入构成数据竞争（go test -race 可复现）
+	sess.mu.Lock()
+	recv, size := sess.Received, sess.Size
+	sess.mu.Unlock()
+	writeJSON(w, 200, map[string]any{"ok": true, "received": recv, "size": size})
 }
 
 // handleUploadAbort DELETE /api/upload/chunk?id= —— 放弃上传并删除分片
@@ -3315,6 +3653,23 @@ func zipAdd(zw *zip.Writer, root, abs, name string) error {
 	if err != nil {
 		return err
 	}
+	// 符号链接绝不入包：os.Open 会跟随链接，把 root 外文件内容
+	// 打进公开分享的 zip（本地攻击者预放链接即可借道外泄任意文件）。
+	// 指向目录的链接同样在此拦截（Lstat 的 symlink 不算 IsDir）
+	if info.Mode()&os.ModeSymlink != 0 {
+		log.Printf("[打包] 跳过符号链接 %s", abs)
+		return nil
+	}
+	// 双保险：即便链接在打包窗口期被替换，解析后的真实路径越界也要拦
+	if root != "" {
+		rootReal, rerr := filepath.EvalSymlinks(root)
+		real, aerr := filepath.EvalSymlinks(abs)
+		// 条目解析失败（悬空/环）交给后续 os.Open 自然报错；解析成功就必须在根内
+		if rerr == nil && aerr == nil && !pathWithin(rootReal, real) {
+			log.Printf("[打包] 跳过越界条目 %s", abs)
+			return nil
+		}
+	}
 	if info.IsDir() {
 		h := &zip.FileHeader{Name: name + "/", Method: zip.Store}
 		h.SetMode(info.Mode())
@@ -3406,7 +3761,7 @@ func handleDelete(w http.ResponseWriter, r *http.Request, root string) {
 	}
 	// 删除 = 移入回收站（同盘 rename，原子且廉价），可在回收站页面恢复
 	if _, err := moveToTrash(root, target); err != nil {
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		writeJSON(w, 500, map[string]any{"error": fsErr("移入回收站", err)})
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "trashed": true})
@@ -3574,13 +3929,13 @@ func handleMove(w http.ResponseWriter, r *http.Request, root string) {
 		writeJSON(w, 400, map[string]any{"error": "回收站内容请从回收站页面操作"})
 		return
 	}
-	if fromAbs == toAbs {
+	if fromAbs == toAbs || absEqual(fromAbs, toAbs) {
 		writeJSON(w, 400, map[string]any{"error": "源与目标是同一路径"})
 		return
 	}
 	// 自嵌套校验：不能把文件夹移动到它自己的子目录里。
 	// 前端已拦截，但 API 层必须兜底，否则只能靠 os.Rename 报 500
-	if strings.HasPrefix(toAbs, fromAbs+string(filepath.Separator)) {
+	if absPrefix(fromAbs, toAbs) {
 		writeJSON(w, 400, map[string]any{"error": "不能移动到自身或其子目录下"})
 		return
 	}
@@ -3588,17 +3943,23 @@ func handleMove(w http.ResponseWriter, r *http.Request, root string) {
 		writeJSON(w, 404, map[string]any{"error": "源文件不存在"})
 		return
 	}
-	if _, err := os.Lstat(toAbs); err == nil {
+	if tf, err := os.Lstat(toAbs); err == nil {
+		// Windows/macOS 大小写不敏感文件系统上「仅改变大小写」的目标与源
+		// 指向同一个文件，Lstat 命中不能一概判为冲突
+		if sf, err2 := os.Lstat(fromAbs); err2 == nil && os.SameFile(tf, sf) {
+			writeJSON(w, 400, map[string]any{"error": "源与目标是同一路径"})
+			return
+		}
 		writeJSON(w, 400, map[string]any{"error": "目标位置已存在同名文件或文件夹"})
 		return
 	}
 	// 目标目录必须已存在（不隐式创建，避免误操作堆出目录树）
-	if err := os.MkdirAll(filepath.Dir(toAbs), 0o755); err != nil {
+	if st, err := os.Stat(filepath.Dir(toAbs)); err != nil || !st.IsDir() {
 		writeJSON(w, 400, map[string]any{"error": "目标目录不存在"})
 		return
 	}
 	if err := os.Rename(fromAbs, toAbs); err != nil {
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		writeJSON(w, 500, map[string]any{"error": fsErr("移动/重命名", err)})
 		return
 	}
 	// 同步修正引用旧路径的分享记录，链接不断。
@@ -3614,12 +3975,12 @@ func moveShareSync(root, fromAbs, toAbs string) bool {
 	changed := false
 	shareMu.Lock()
 	for _, s := range shares {
-		if s.AbsPath == fromAbs { // 被移动的文件/目录本身
+		if absEqual(s.AbsPath, fromAbs) { // 被移动的文件/目录本身
 			s.AbsPath = toAbs
 			s.RelPath = newRel
 			s.Name = filepath.Base(toAbs)
 			changed = true
-		} else if strings.HasPrefix(s.AbsPath, fromAbs+string(filepath.Separator)) {
+		} else if absPrefix(fromAbs, s.AbsPath) {
 			// 目录内子文件的分享：前缀整体替换，RelPath 基于新 AbsPath 重算
 			s.AbsPath = toAbs + strings.TrimPrefix(s.AbsPath, fromAbs)
 			s.RelPath = filepath.ToSlash(strings.TrimPrefix(strings.TrimPrefix(s.AbsPath, root), string(filepath.Separator)))
@@ -3641,6 +4002,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request, root string) {
 		limit = 200
 	}
 	results := []map[string]any{}
+	scanTruncated := false
 	if q != "" {
 		scanned := 0
 		var walk func(dir, rel string) bool // false = 提前终止
@@ -3656,6 +4018,9 @@ func handleSearch(w http.ResponseWriter, r *http.Request, root string) {
 				}
 				scanned++
 				if scanned > 200000 {
+					// 扫描上限触发的提前终止必须让前端知道，
+					// 否则界面显示「完整结果」，用户误判文件不存在
+					scanTruncated = true
 					return false
 				}
 				childRel := name
@@ -3684,7 +4049,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request, root string) {
 		}
 		walk(root, "")
 	}
-	writeJSON(w, 200, map[string]any{"results": results, "truncated": len(results) >= limit})
+	writeJSON(w, 200, map[string]any{"results": results, "truncated": len(results) >= limit || scanTruncated})
 }
 
 // ---------------- WebDAV（Class 1 最小子集） ----------------
@@ -3899,12 +4264,21 @@ func davGet(w http.ResponseWriter, r *http.Request, root, rel string) {
 		return
 	}
 	defer f.Close()
-	// 内联返回（不设 attachment）：播放器按 Content-Type 流式读取，Range 拖动由 ServeContent 处理
-	ct := "application/octet-stream"
-	if t := mime.TypeByExtension(strings.ToLower(filepath.Ext(p))); t != "" {
-		ct = t
+	// 内联返回（不设 attachment）：播放器按 Content-Type 流式读取，Range 拖动由 ServeContent 处理。
+	// 例外：text/html 与 SVG 同源内联渲染会执行其中脚本（CSP 的 unsafe-inline 拦不住），
+	// 是已登录上下文的存储型 XSS 面，一律强制按附件下载
+	ext := strings.ToLower(filepath.Ext(p))
+	if ext == ".html" || ext == ".htm" || ext == ".svg" {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", contentDisposition("attachment", st.Name()))
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+	} else {
+		ct := "application/octet-stream"
+		if t := mime.TypeByExtension(ext); t != "" {
+			ct = t
+		}
+		w.Header().Set("Content-Type", ct)
 	}
-	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeContent(w, r, st.Name(), st.ModTime(), f)
 }
@@ -3934,8 +4308,9 @@ func davPut(w http.ResponseWriter, r *http.Request, root, rel string) {
 		w.WriteHeader(405)
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		w.WriteHeader(500)
+	// RFC 4918：父集合不存在 → 409（隐式 MkdirAll 会把打错的路径静默造成目录树）
+	if st, err := os.Stat(filepath.Dir(p)); err != nil || !st.IsDir() {
+		w.WriteHeader(http.StatusConflict)
 		return
 	}
 	created := true
@@ -4000,7 +4375,12 @@ func davMkcol(w http.ResponseWriter, r *http.Request, root, rel string) {
 		w.WriteHeader(405) // 已存在
 		return
 	}
-	if err := os.MkdirAll(p, 0o755); err != nil {
+	// RFC 4918 9.3：父集合必须已存在（409），只创建单级集合
+	if st, err := os.Stat(filepath.Dir(p)); err != nil || !st.IsDir() {
+		w.WriteHeader(http.StatusConflict)
+		return
+	}
+	if err := os.Mkdir(p, 0o755); err != nil {
 		w.WriteHeader(500)
 		return
 	}
@@ -4072,36 +4452,56 @@ func davMove(w http.ResponseWriter, r *http.Request, root, rel string) {
 		return
 	}
 	// 自移动（源=目标）：若不拦截，下面「目标已存在→先入回收站」会把文件本身
-	// 移进回收站，随后 rename 因源已不存在而 500，用户视角等于文件丢失
-	if fromAbs == toAbs {
-		w.WriteHeader(403)
-		return
+	// 移进回收站，随后 rename 因源已不存在而 500，用户视角等于文件丢失。
+	// Windows 大小写不敏感 FS 上仅改大小写的 MOVE 字符串比较不相等，
+	// 必须用 os.SameFile 判定，否则目标会被自己覆盖进回收站
+	if fi, err := os.Lstat(fromAbs); err == nil {
+		if ti, err2 := os.Lstat(toAbs); err2 == nil && os.SameFile(fi, ti) {
+			w.WriteHeader(403)
+			return
+		}
 	}
 	// 自嵌套：把目录移到它自己的子目录里，rename 只会报 EINVAL，
 	// 必须在改动磁盘前拒绝（与网页端 /api/move 的校验对齐）
-	if strings.HasPrefix(toAbs, fromAbs+string(filepath.Separator)) {
+	if absPrefix(fromAbs, toAbs) {
 		w.WriteHeader(409)
 		return
 	}
 	overwrite := !strings.EqualFold(r.Header.Get("Overwrite"), "F")
 	existed := false
+	trashedEntry := ""
 	if _, err := os.Lstat(toAbs); err == nil {
 		existed = true
 		if !overwrite {
 			w.WriteHeader(412) // 目标已存在且 Overwrite: F
 			return
 		}
-		// Overwrite: T → 目标先进回收站
-		if _, err := moveToTrash(root, toAbs); err != nil {
+		// Overwrite: T → 目标先进回收站（记录条目名，rename 失败时回滚）
+		if e, err := moveToTrash(root, toAbs); err != nil {
 			w.WriteHeader(500)
 			return
+		} else {
+			trashedEntry = e
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(toAbs), 0o755); err != nil {
-		w.WriteHeader(500)
+	// RFC 4918：父集合不存在 → 409
+	if st, err := os.Stat(filepath.Dir(toAbs)); err != nil || !st.IsDir() {
+		if trashedEntry != "" {
+			if _, rerr := trashRestore(root, trashedEntry); rerr != nil {
+				log.Printf("[dav] MOVE 失败且回滚失败，目标滞留回收站（%s）: %v", trashedEntry, rerr)
+			}
+		}
+		w.WriteHeader(http.StatusConflict)
 		return
 	}
 	if err := os.Rename(fromAbs, toAbs); err != nil {
+		// rename 失败必须把已进回收站的目标恢复原位，
+		// 否则用户视角是「文件消失」+ 500 的不一致态
+		if trashedEntry != "" {
+			if _, rerr := trashRestore(root, trashedEntry); rerr != nil {
+				log.Printf("[dav] MOVE 失败且回滚失败，目标滞留回收站（%s）: %v", trashedEntry, rerr)
+			}
+		}
 		w.WriteHeader(500)
 		return
 	}
@@ -4150,6 +4550,8 @@ func startTidy() {
 			}
 			// 分享密码防爆破记录：过期条目回收，防止 map 长期缓慢增长
 			sharePwGCSweep()
+			// 预览记录：已不存在分享的条目回收
+			previewGC()
 			// 分片上传会话：超 24h 的会话连同分片文件一并回收
 			gcUploadSessions()
 		}
@@ -4225,6 +4627,10 @@ func tidyPending() int {
 	}
 	return n
 }
+
+// maxExpireSeconds 分享有效期上限（10 年）：无上限的 ExpireSeconds 乘 1000
+// 会溢出成负数，「>0 判定」失效，链接被当成永久且永不回收
+const maxExpireSeconds = int64(10 * 365 * 24 * 3600)
 
 func handleShareCreate(w http.ResponseWriter, r *http.Request, root string) {
 	var body struct {
@@ -4340,6 +4746,10 @@ func handleShareCreate(w http.ResponseWriter, r *http.Request, root string) {
 		pw := strings.TrimSpace(body.Password)
 		setSharePassword(rec, pw)
 	}
+	if body.ExpireSeconds > maxExpireSeconds {
+		writeJSON(w, 400, map[string]any{"error": "有效期过长（最长 10 年）"})
+		return
+	}
 	if body.ExpireSeconds > 0 {
 		rec.ExpiresAt = time.Now().UnixMilli() + body.ExpireSeconds*1000
 	}
@@ -4351,6 +4761,9 @@ func handleShareCreate(w http.ResponseWriter, r *http.Request, root string) {
 		return
 	}
 	shares[token] = rec
+	// publicOne 读 Downloads 等字段，必须锁内完成：
+	// 锁外用 live 指针读会与 countOnce/handleShareUpdate 的锁内写竞争
+	out := publicOne(rec)
 	shareMu.Unlock()
 	saveShares()
 
@@ -4369,18 +4782,20 @@ func handleShareCreate(w http.ResponseWriter, r *http.Request, root string) {
 	}
 	writeJSON(w, 200, map[string]any{
 		"ok":    true,
-		"share": publicOne(rec),
+		"share": out,
 		"url":   fmt.Sprintf("%s://%s/s/%s", scheme, host, slug),
 	})
 }
 
-// handleShareUpdate 快速编辑分享：不删除重建，直接修改过期时间 / 密码 / 访问方式
+// handleShareUpdate 快速编辑分享：不删除重建，直接修改过期时间 / 密码 / 访问方式。
+// 全部字段用指针语义（nil = 不修改）：旧的值类型字段在「只改个别项」的
+// 快速编辑里会把有效期/密码/访问方式静默清空，永久链接秒变 1 小时或反之
 func handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Token     string  `json:"token"`
-		ExpiresAt int64   `json:"expiresAt"` // 毫秒时间戳，0 = 永久
-		Password  string  `json:"password"`  // 空 = 清除密码保护
-		Mode      string  `json:"mode"`      // "direct"（默认）| "page"
+		ExpiresAt *int64  `json:"expiresAt"` // 毫秒时间戳，0 = 永久；null = 不修改
+		Password  *string `json:"password"`  // null = 不修改；"" = 清除密码保护
+		Mode      *string `json:"mode"`      // "direct"（默认）| "page"；null = 不修改
 		Alias     *string `json:"alias"`     // 可选：null = 不修改；"" = 清除别名
 		Hotlink   *bool   `json:"hotlink"`   // 可选：null = 不修改
 	}
@@ -4388,8 +4803,12 @@ func handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
 		return
 	}
-	if body.ExpiresAt < 0 {
+	if body.ExpiresAt != nil && *body.ExpiresAt < 0 {
 		writeJSON(w, 400, map[string]any{"error": "过期时间不合法"})
+		return
+	}
+	if body.Mode != nil && *body.Mode != "" && *body.Mode != "direct" && *body.Mode != "page" {
+		writeJSON(w, 400, map[string]any{"error": "访问方式不合法"})
 		return
 	}
 	if body.Alias != nil && strings.TrimSpace(*body.Alias) != "" {
@@ -4416,7 +4835,9 @@ func handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "别名已被占用: " + normalizeAlias(*body.Alias)})
 		return
 	}
-	rec.ExpiresAt = body.ExpiresAt
+	if body.ExpiresAt != nil {
+		rec.ExpiresAt = *body.ExpiresAt
+	}
 	if body.Alias != nil {
 		if strings.TrimSpace(*body.Alias) == "" {
 			rec.Alias = ""
@@ -4427,16 +4848,20 @@ func handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 	if body.Hotlink != nil {
 		rec.Hotlink = *body.Hotlink
 	}
-	pw := strings.TrimSpace(body.Password)
-	if pw != "" {
-		setSharePassword(rec, pw)
-	} else {
-		clearSharePassword(rec) // 留空 = 清除密码保护
+	if body.Password != nil {
+		pw := strings.TrimSpace(*body.Password)
+		if pw != "" {
+			setSharePassword(rec, pw)
+		} else {
+			clearSharePassword(rec) // 显式空串 = 清除密码保护
+		}
 	}
-	if body.Mode == "page" {
-		rec.Mode = "page"
-	} else {
-		rec.Mode = ""
+	if body.Mode != nil {
+		if *body.Mode == "page" {
+			rec.Mode = "page"
+		} else {
+			rec.Mode = ""
+		}
 	}
 	out := publicOne(rec)
 	shareMu.Unlock()
@@ -4465,6 +4890,9 @@ func handleSessionsList(w http.ResponseWriter, r *http.Request) {
 	sessMu.Lock()
 	items := []sessItem{}
 	for tok, s := range sessions {
+		if s == nil {
+			continue
+		}
 		if s.ExpiresAt > 0 && s.ExpiresAt < now {
 			continue
 		}
@@ -4488,17 +4916,33 @@ func handleSessionKick(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误"})
 		return
 	}
+	// 会话 ID 是 token 前 12 位：必须完整传入并精确匹配。
+	// 无长度约束的前缀匹配会踢中不确定目标（id="1" 命中第一个前缀相符者），
+	// 若先命中当前会话还会反把自己踢下线的请求挡回 400
+	if len(body.ID) != 12 {
+		writeJSON(w, 400, map[string]any{"error": "会话 ID 不合法（需完整 12 位）"})
+		return
+	}
 	cur := ""
 	if c, err := r.Cookie(sessionCookie); err == nil {
 		cur = c.Value
 	}
 	sessMu.Lock()
 	found := ""
+	ambiguous := false
 	for tok := range sessions {
-		if strings.HasPrefix(tok, body.ID) {
+		if len(tok) >= 12 && tok[:12] == body.ID {
+			if found != "" {
+				ambiguous = true
+				break
+			}
 			found = tok
-			break
 		}
+	}
+	if ambiguous {
+		sessMu.Unlock()
+		writeJSON(w, 409, map[string]any{"error": "会话 ID 冲突，请刷新后重试"})
+		return
 	}
 	if found == "" {
 		sessMu.Unlock()
@@ -4939,7 +5383,9 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 			appendShareLog(l, ip, ua, false, note)
 		}
 		shareMu.Unlock()
-		saveShares()
+		// 失败日志延迟落盘：旧的每条失败都全量重写 shares.json，
+		// 未认证请求可以以此放大磁盘 IO 并刷日志（见 startSharesFlush）
+		markSharesDirty()
 	}
 	if rec.ExpiresAt > 0 && time.Now().UnixMilli() > rec.ExpiresAt {
 		logFail("链接已过期")
@@ -5013,6 +5459,13 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 			renderSharePage(w, rec, true, false, givenPw, msg, http.StatusTooManyRequests, isDirShare)
 			return
 		}
+		if givenPw == "" {
+			// 空密码直接按「未提供」渲染表单，不跑 PBKDF2：
+			// 旧的无条件校验让匿名请求每次都烧满 50k 轮（弱设备 CPU DoS），
+			// 且空密码本来就不可能通过非空口令的哈希校验
+			renderSharePage(w, rec, true, false, "", "", http.StatusOK, isDirShare)
+			return
+		}
 		ok, legacy := verifyPwHash(nsShare, givenPw, rec.PasswordHash)
 		if legacy && ok {
 			// 旧分享记录的哈希还是单次 sha256：校验通过后就地升级并落盘
@@ -5052,6 +5505,27 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 	// HEAD 不是真实下载：下载器/IM/邮件客户端的链接预检都会先发 HEAD，
 	// 若计次会「看一眼就把一次性链接打死」，因此与续传同样处理
 	isHead := r.Method == http.MethodHead
+	// HEAD 请求文件夹分享：只回响应头，不做完整遍历+压缩
+	// （旧实现 HEAD 也全量打包，零配额消耗 CPU/IO 且不留访问日志无法审计）
+	if isDirShare && isHead {
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Content-Disposition", contentDisposition("attachment", rec.Name)+".zip")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(200)
+		return
+	}
+	// 「到文件末尾」的传输（无 Range 或 Range 覆盖到末尾）持票并发互斥：
+	// 防止一次合法计次后 N 个并发 Range: bytes=1- 同时通过准入、
+	// 每条都拿到接近完整的文件（ticket 的 Served 在响应结束才累加）
+	ticketNow := dlTicketOf(r)
+	if !isDirShare && !isHead && hasTicket && rangeCoversToEnd(r, st.Size()) {
+		if !dlInFlightAdd(ticketNow) {
+			logFail("同一链接的并发下载已超限")
+			writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "该链接正在下载中，请勿并发重复下载"})
+			return
+		}
+		defer dlInFlightDone(ticketNow)
+	}
 	// countOnce 在 shareMu 内原子地完成「检查配额 + 扣减」，
 	// 避免 MaxDownloads=1 时并发请求同时通过前置检查造成超发；返回 false 表示配额已用完
 	countOnce := func() bool {
@@ -5106,12 +5580,18 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 			// 仅首次完整拉取（无 Range）记一条「预览」访问日志，拖动进度条产生的
 			// Range 片段不记，避免日志被同一播放会话刷屏
 			if r.Header.Get("Range") == "" {
+				// 完整内容预览每 IP 只放行一次：inline 不计数是给「看一眼」用的，
+				// 不限次等于绕过 maxDownloads 无限取回完整文件
+				if !previewAllow(token, ip) {
+					writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "完整预览已获取过，请通过下载按钮获取文件"})
+					return
+				}
 				shareMu.Lock()
 				if l := shares[token]; l != nil {
 					appendShareLog(l, ip, ua, true, "预览")
 				}
 				shareMu.Unlock()
-				saveShares()
+				markSharesDirty()
 			}
 			serveInline(w, r, rec.AbsPath, rec.Name)
 			return
@@ -5206,6 +5686,108 @@ func sharePwClear(token, ip string) {
 	sharePwMu.Lock()
 	delete(sharePwFails, sharePwKey(token, ip))
 	sharePwMu.Unlock()
+}
+
+// previewDone 每个 token|ip 只允许一次「完整内容」的 inline 预览拉取。
+// ?inline=1 不计数是设计使然（一次性链接看一眼预览不该烧掉唯一一次下载），
+// 但完全不限的话，图片/音视频分享可以无限次取回完整字节，maxDownloads 形同虚设。
+// 按 IP 记账（clientIP 已做转发头信任处理，伪造 XFF 打不进来）
+var (
+	previewMu    sync.Mutex
+	previewDone  = map[string]bool{}
+	previewFull  = errors.New("完整预览已获取过，请通过下载按钮获取文件")
+	previewMaxIP = 8192 // 防 map 无限增长的上限
+)
+
+func previewAllow(token, ip string) bool {
+	key := token + "|" + ip
+	previewMu.Lock()
+	defer previewMu.Unlock()
+	if len(previewDone) > previewMaxIP {
+		previewDone = map[string]bool{} // 粗粒度兜底：极端情况下整体重置，不阻断服务
+	}
+	if previewDone[key] {
+		return false
+	}
+	previewDone[key] = true
+	return true
+}
+
+// previewGC 回收已不存在分享的预览记录（每小时清理任务调用）
+func previewGC() {
+	shareMu.Lock()
+	defer shareMu.Unlock()
+	previewMu.Lock()
+	defer previewMu.Unlock()
+	for k := range previewDone {
+		i := strings.IndexByte(k, '|')
+		if i <= 0 {
+			delete(previewDone, k)
+			continue
+		}
+		if _, ok := shares[k[:i]]; !ok {
+			delete(previewDone, k)
+		}
+	}
+}
+
+// dlInFlight 每个 ticket 同时只允许一条「到文件末尾」的传输在途：
+// 一次合法计次后并发 N 个 Range: bytes=1- 的请求在准入时都读到 Served < size，
+// 全部放行会把一次下载放大成 N 次完整内容下发
+var (
+	dlInFlightMu sync.Mutex
+	dlInFlight   = map[string]int{}
+)
+
+func dlInFlightAdd(t string) bool {
+	if t == "" {
+		return true
+	}
+	dlInFlightMu.Lock()
+	defer dlInFlightMu.Unlock()
+	if dlInFlight[t] >= 1 {
+		return false
+	}
+	dlInFlight[t]++
+	return true
+}
+
+func dlInFlightDone(t string) {
+	if t == "" {
+		return
+	}
+	dlInFlightMu.Lock()
+	if dlInFlight[t] > 0 {
+		dlInFlight[t]--
+	}
+	if dlInFlight[t] == 0 {
+		delete(dlInFlight, t)
+	}
+	dlInFlightMu.Unlock()
+}
+
+// sharesDirty 失败访问日志的延迟落盘标记：过期链接/密码错误等未认证的失败
+// 请求每一次都全量重写 shares.json 是写放大（DoS + SSD 磨损），
+// 改为内存累计 + 定期批量落盘
+var sharesDirty int32
+
+func markSharesDirty() { atomic.StoreInt32(&sharesDirty, 1) }
+
+func startSharesFlush() {
+	go func() {
+		for range time.Tick(30 * time.Second) {
+			if atomic.CompareAndSwapInt32(&sharesDirty, 1, 0) {
+				saveShares()
+			}
+		}
+	}()
+}
+
+// flushSharesOnExit 优雅关闭前把未落盘的日志刷出去
+func flushSharesOnExit() {
+	if atomic.CompareAndSwapInt32(&sharesDirty, 1, 0) {
+		saveShares()
+	}
 }
 
 // renderSharePage 的 status 参数：正常页传 200，密码错误次数过多被封禁时传 429，
@@ -5330,9 +5912,23 @@ func main() {
 		return
 	}
 
+	// 鉴权组合的启动即校验：只设用户名不设密码 = 空密码即可登录（等于没设认证）；
+	// 只设密码不设用户名 = checkAuth 对空用户名直接放行，全 API 裸奔。
+	// 与其带着虚假的「认证已开启」横幅上线，不如拒绝启动并说清楚。
+	// 注意放在 loadConfig 之后：网页改过密（config.json 有哈希）时允许 -pass 留空
 	loadConfig()
 	loadShares()
 	loadSessions()
+	if flagUser != "" && flagPass == "" && authRecord() == "" {
+		fmt.Println("错误：设置了 -user/AUTH_USER 但没有设置 -pass/AUTH_PASS，空密码即可登录。")
+		fmt.Println("      请补齐密码，或同时去掉两者以明确关闭认证。")
+		os.Exit(1)
+	}
+	if flagUser == "" && flagPass != "" {
+		fmt.Println("错误：只设置了 -pass/AUTH_PASS 而未设置 -user/AUTH_USER，认证不会生效。")
+		fmt.Println("      请同时设置两者。")
+		os.Exit(1)
+	}
 	// ROOT_DIR/-dir 仅作为首次初始化的默认值：
 	// config.json 中已有根目录时不覆盖，否则服务重启（含每次更新）会把用户改过的目录打回环境变量里的值
 	if flagDir != "" && cfg.RootDir == "" {
@@ -5364,8 +5960,9 @@ func main() {
 	}
 	fmt.Println("============================================")
 
-	startBanGC() // 认证失败记录的定期清理
-	startTidy()  // 过期分享记录的定期清理
+	startBanGC()       // 认证失败记录的定期清理
+	startTidy()        // 过期分享记录的定期清理
+	startSharesFlush() // 失败访问日志的批量落盘
 
 	srv := &http.Server{
 		Addr:              addr,
@@ -5375,14 +5972,30 @@ func main() {
 		// 大文件下载是长流式响应，设了会把慢速下载掐断
 		IdleTimeout: 120 * time.Second,
 	}
-	if err := srv.ListenAndServe(); err != nil {
+	// 优雅关闭：在途下载/tidy 被硬切会丢状态；先停接新请求，
+	// 给在途请求最多 10 秒收尾，并刷掉未落盘的分享日志
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		<-sig
+		log.Println("[退出] 收到退出信号，正在等待在途请求结束…")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+	flushSharesOnExit()
 }
 
-// 默认数据目录：可执行文件同级目录下的 data/
-// 部署为服务时建议显式指定 -data-dir（如 /var/lib/fileserver），便于持久化
+// 默认数据目录：可执行文件同级目录下的 data/。
+// 旧的 filepath.Join(".", "data") 跟随 CWD——从别的目录启动就表现为
+// 「密码被重置/分享全丢」并在意外位置新建数据目录
 func defaultDataDir() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Join(filepath.Dir(exe), "data")
+	}
 	return filepath.Join(".", "data")
 }
 func orDefault(s, def string) string {

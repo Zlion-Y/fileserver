@@ -20,8 +20,9 @@ jobs:
           - { goos: linux,   goarch: arm, goarm: "7", name: linux_armv7 }
           - { goos: linux,   goarch: arm, goarm: "5", name: linux_armv5 }
           - { goos: linux,   goarch: "386",        name: linux_386 }
-          - { goos: linux,   goarch: mipsle,       name: linux_mipsle }
+          - { goos: linux,   goarch: mipsle, gomips: softfloat, name: linux_mipsle }
           - { goos: windows, goarch: amd64,        name: windows_amd64 }
+          - { goos: darwin,  goarch: amd64,        name: darwin_amd64 }
           - { goos: darwin,  goarch: arm64,        name: darwin_arm64 }
     steps:
       # fetch-depth: 0 —— 必须拿全量历史与所有 tag，否则下面的 git tag / git log
@@ -39,6 +40,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
         run: |
           # 把提交清单格式化成「- 标题 + 两空格缩进正文」；正文跳过空行与签名，
           # 单条最多 12 行。此前只注入标题，提交正文里的详细修复清单全部丢失。
@@ -162,10 +164,18 @@ jobs:
           cat body.md
       - uses: actions/download-artifact@v4
         with: { path: dist, merge-multiple: true }
+      # 生成 SHA256SUMS：install-remote.sh / 用户下载后可校验完整性
+      - name: 生成 SHA256SUMS
+        run: |
+          cd dist
+          sha256sum fileserver_* > SHA256SUMS
+          cat SHA256SUMS
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            dist/fileserver_*
+            dist/SHA256SUMS
           body_path: body.md
           # 关闭自动生成：直接 push 仓库生成的只有一行 Full Changelog，
           # 会作为噪音混进旧版本客户端展示的说明里；compare 链接已在 body 中给出

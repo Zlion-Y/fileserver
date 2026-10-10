@@ -69,7 +69,9 @@ detect_target() {
   case "$m" in
     x86_64|amd64)      echo linux_amd64 ;;
     aarch64|arm64)     echo linux_arm64 ;;
-    armv7*|armv6*|armhf) echo linux_armv7 ;;
+    armv7*|armhf)      echo linux_armv7 ;;
+    # Release 没有 armv6 产物；GOARM=5 产物向后兼容 ARMv6 硬件，误装 armv7 会直接 SIGILL
+    armv6*)            echo linux_armv5 ;;
     mipsel|mipsle)     echo linux_mipsle ;;
     i386|i686)         echo linux_386 ;;
     armv5*|arm*)       # 老 ARM 盒子：按 cpuinfo 再判一次
@@ -82,7 +84,8 @@ TARGET="$(detect_target)"
 
 # ---------- 解析版本号 ----------
 if [ -z "$VERSION" ]; then
-  VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+  VERSION="$(curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 \
+             "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
              | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/' || true)"
 fi
 [ -n "$VERSION" ] || { echo "取不到最新版本号（服务器无法访问 GitHub？）。可先手动指定：sudo VERSION=v1.0.0 bash $0"; exit 1; }
@@ -149,15 +152,35 @@ fi
 # ---------- 下载 ----------
 command -v curl >/dev/null || { echo "需要 curl，请先安装：apt install -y curl / yum install -y curl"; exit 1; }
 TMP="$(mktemp)"
+SUMS_TMP="$(mktemp)"
+cleanup() { rm -f "$TMP" "$SUMS_TMP"; }
+trap cleanup EXIT
 echo "下载中..."
-if ! curl -fsSL "$URL" -o "$TMP"; then
-  rm -f "$TMP"
+if ! curl -fsSL --connect-timeout 10 --max-time 600 --retry 3 --retry-delay 2 "$URL" -o "$TMP"; then
   echo "下载失败：$URL"
   echo "可能原因：该版本没有此架构的产物，或服务器访问不了 GitHub。"
   echo "可手动下载后上传：https://github.com/$REPO/releases"
   exit 1
 fi
-[ -s "$TMP" ] || { rm -f "$TMP"; echo "下载到空文件"; exit 1; }
+[ -s "$TMP" ] || { echo "下载到空文件"; exit 1; }
+
+# ---------- 完整性校验（SHA256SUMS；老版本 Release 没有该文件时跳过并提示） ----------
+SUMS_URL="https://github.com/$REPO/releases/download/$VERSION/SHA256SUMS"
+if curl -fsSL --connect-timeout 10 --max-time 60 --retry 2 "$SUMS_URL" -o "$SUMS_TMP" 2>/dev/null && [ -s "$SUMS_TMP" ]; then
+  want="$(grep -E "[[:space:]]${ASSET}\$|[[:space:]]${ASSET}\.exe\$" "$SUMS_TMP" | awk '{print $1}' | head -1)"
+  if [ -n "$want" ]; then
+    got="$(sha256sum "$TMP" | awk '{print $1}')"
+    if [ "$got" != "$want" ]; then
+      echo "校验失败：SHA256 不匹配（期望 $want，实际 $got），已中止安装。"
+      exit 1
+    fi
+    echo "SHA256 校验通过：$got"
+  else
+    echo "提示：SHA256SUMS 中没有 $ASSET 的条目，跳过完整性校验。"
+  fi
+else
+  echo "提示：该版本没有 SHA256SUMS，跳过完整性校验。"
+fi
 
 systemctl stop fileserver 2>/dev/null || true
 install -m 0755 "$TMP" "$BIN"
@@ -166,17 +189,30 @@ rm -f "$TMP"
 
 # ---------- 目录与配置 ----------
 mkdir -p "$DIR" "$DATA_DIR"
+# 重跑/升级时保留用户已改过的配置（MAX_UPLOAD_MB/LOG/TRUST_PROXY 等），
+# 只有当前会话没给、env 文件里也没有的键才写默认值
+prev_max_upload=""; prev_log=""; prev_proxy=""; prev_data_dir=""
+if [ -f "$ENVFILE" ]; then
+  prev_max_upload="$(grep -E '^MAX_UPLOAD_MB=' "$ENVFILE" 2>/dev/null | cut -d= -f2- || true)"
+  prev_log="$(grep -E '^LOG=' "$ENVFILE" 2>/dev/null | cut -d= -f2- || true)"
+  prev_proxy="$(grep -E '^TRUST_PROXY=' "$ENVFILE" 2>/dev/null | cut -d= -f2- || true)"
+  prev_data_dir="$(grep -E '^DATA_DIR=' "$ENVFILE" 2>/dev/null | cut -d= -f2- || true)"
+fi
+[ -n "$prev_max_upload" ] || prev_max_upload=0
+[ -n "$prev_log" ] || prev_log=1
+[ -n "$prev_proxy" ] || prev_proxy="$FS_PROXY"
+[ -n "$prev_data_dir" ] || prev_data_dir="$DATA_DIR"
 cat > "$ENVFILE" <<EOF
 PORT=$PORT
 HOST=0.0.0.0
 # ROOT_DIR 仅在首次初始化（config.json 不存在）时生效，之后以网页配置为准
 ROOT_DIR=$DIR
-DATA_DIR=$DATA_DIR
-TRUST_PROXY=$FS_PROXY
-AUTH_USER=$FS_USER
-AUTH_PASS=$FS_PASS
-MAX_UPLOAD_MB=0
-LOG=1
+DATA_DIR=$prev_data_dir
+TRUST_PROXY=$prev_proxy
+AUTH_USER="$FS_USER"
+AUTH_PASS="$FS_PASS"
+MAX_UPLOAD_MB=$prev_max_upload
+LOG=$prev_log
 EOF
 chmod 0600 "$ENVFILE"
 
@@ -206,7 +242,12 @@ if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl --no-pager status fileserver | head -12 || true
 else
   echo "未检测到 systemd（容器/精简系统），已跳过服务注册。"
-  echo "手动启动：setsid $BIN >/var/log/fileserver.log 2>&1 &"
+  # 非 systemd 分支也必须加载配置文件，否则认证/端口/目录全走默认值
+  echo "手动启动：set -a; source $ENVFILE; set +a; setsid $BIN >/var/log/fileserver.log 2>&1 &"
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENVFILE"
+  set +a
   setsid "$BIN" >/tmp/fileserver.log 2>&1 &
   sleep 1
 fi

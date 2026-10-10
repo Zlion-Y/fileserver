@@ -15,12 +15,13 @@ services:
       DATA_DIR: /app/data
       # 走反向代理时必须为 1，分享链接才会用真实域名/协议
       TRUST_PROXY: "1"
-      # 管理端访问密码（强烈建议设置，分享下载链接不受影响）
-      AUTH_USER: admin
-      AUTH_PASS: "change-me-please"
+      # 以下带 ${VAR:-default} 的项会读取同目录 .env 文件（参见 .env.example），
+      # 未提供时使用这里写的默认值。请勿把真实密码提交进仓库。
+      AUTH_USER: ${AUTH_USER:-admin}
+      AUTH_PASS: ${AUTH_PASS:-change-me-please}
       # 单文件上传上限（MB），0 表示不限制
-      MAX_UPLOAD_MB: "0"
-      LOG: "1"
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-0}
+      LOG: ${LOG:-1}
     volumes:
       - ./files:/files
       - ./data:/app/data

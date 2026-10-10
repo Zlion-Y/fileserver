@@ -4,7 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
+# 建议使用非 root 专用用户（安装脚本可用 FS_USER 指定，例如 useradd -r -s /usr/sbin/nologin fileserver）
+# User=fileserver
+# Group=fileserver
 # 手动套用本模板时 /opt/fileserver 可能不存在，systemd 会因 CHDIR 失败而启动不了，故先创建
 ExecStartPre=/bin/mkdir -p /opt/fileserver /opt/fileserver/data
 WorkingDirectory=/opt/fileserver
@@ -22,6 +24,21 @@ Restart=always
 RestartSec=3
 StandardOutput=journal
 StandardError=journal
+
+# ---- 安全加固 ----
+# 注意：未启用 ProtectSystem=strict，因为 ExecStartPre 需要在 /opt 下建目录；
+#       若去掉 ExecStartPre 并预先创建好目录，可改回 strict 并配 ReadWritePaths 收紧。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
 
 [Install]
 WantedBy=multi-user.target

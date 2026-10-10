@@ -2,6 +2,13 @@
 /* FileHub 前端：侧边栏导航 + 文件表格 + 分享/搜索/日志 */
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
+// 站点根路径：默认根部署（BASE=''）。挂在反向代理子路径下时，把 index.html
+// 的 <html> 标签加 data-base="/子路径"，全站 API 请求、登录跳转与分享链接
+// 都会自动带上前缀（旧版硬编码 '/'，子路径部署必 404）
+const BASE = (() => {
+  const b = document.documentElement.dataset.base || '';
+  return b === '/' ? '' : b.replace(/\/+$/, '');
+})();
 // 防御式绑定：元素缺失时只跳过，不抛异常中断后续初始化
 function on(selOrEl, ev, fn) {
   const el = typeof selOrEl === 'string' ? $(selOrEl) : selOrEl;
@@ -41,7 +48,7 @@ async function api(url, opt) {
   const ct = r.headers.get('content-type') || '';
   const data = ct.includes('json') ? await r.json() : await r.text();
   if (!r.ok && r.status === 401 && data && data.code === 'AUTH') {
-    location.href = '/login';
+    location.href = BASE + '/login';
     return null;
   }
   if (!r.ok && r.status === 409 && data && data.code === 'NO_ROOT') { showSetup(); return null; }
@@ -104,7 +111,7 @@ const fileExt = (name) => {
 
 /* ---------------- 启动 ---------------- */
 (async function init() {
-  const s = await api('/api/state');
+  const s = await api(BASE + '/api/state');
   if (!s) return;
   state.quick = s.quick || {};
   state.platform = s.platform;
@@ -156,7 +163,7 @@ on('#setup-confirm', 'click', async () => {
   const v = $('#setup-path').value.trim();
   if (!v) return toast('请输入目录路径');
   try {
-    const r = await api('/api/config', {
+    const r = await api(BASE + '/api/config', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ rootDir: v })
     });
@@ -217,8 +224,8 @@ function switchView(name) {
 // 所有带 data-view 的导航项统一走视图切换
 $$('.nav-item[data-view]').forEach(b => b.addEventListener('click', () => switchView(b.dataset.view)));
 on('#btn-logout', 'click', async () => {
-  try { await api('/api/logout', { method: 'POST' }); } catch (e) {}
-  location.href = '/login';
+  try { await api(BASE + '/api/logout', { method: 'POST' }); } catch (e) {}
+  location.href = BASE + '/login';
 });
 
 /* ---------------- 目录浏览器（内嵌，无弹窗） ---------------- */
@@ -227,7 +234,7 @@ const dirState = { cur: '' }; // 修改目录视图 / 设置页浏览的当前�
 async function loadDir(p, crumbSel, listSel, st) {
   st = st || dirState;
   st.cur = p;
-  const d = await api('/api/browse?path=' + encodeURIComponent(p));
+  const d = await api(BASE + '/api/browse?path=' + encodeURIComponent(p));
   if (!d) return;
   const c = $(crumbSel), list = $(listSel);
   if (!c || !list) return;
@@ -283,7 +290,7 @@ on('#btn-dir-ok', 'click', () => applyRootDir(dirState.cur));
 async function applyRootDir(p) {
   if (!p) return toast('请先在下方浏览并进入目标目录');
   try {
-    const r = await api('/api/config', {
+    const r = await api(BASE + '/api/config', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ rootDir: p })
     });
@@ -457,7 +464,7 @@ function renderGallery() {
       img.loading = 'lazy';
       img.decoding = 'async';
       img.alt = e.name;
-      img.src = '/api/download?path=' + encodeURIComponent(rel);
+      img.src = BASE + '/api/download?path=' + encodeURIComponent(rel);
       thumb.appendChild(img);
     } else {
       thumb.innerHTML = `<div class="fi ${kind === 'dir' ? 'dir' : 'k-' + kind}">${KIND_SVG[kind]}</div>`;
@@ -471,7 +478,7 @@ function renderGallery() {
     tile.addEventListener('click', () => {
       if (e.isDir) { clearSearch(); loadList(rel); return; }
       if (extKindOf(e.name)) { openPreview(rel, e.name, e.size); return; }
-      location.href = '/api/download?path=' + encodeURIComponent(rel);
+      location.href = BASE + '/api/download?path=' + encodeURIComponent(rel);
     });
     frag.appendChild(tile);
   });
@@ -558,7 +565,7 @@ function buildRow(e, searchMode) {
     // 图片/视频/音频可直接预览（浏览器端渲染，服务端只透传文件流）
     if (extKindOf(e.name)) actions.appendChild(mkAction('预览', 'btn-soft mini', () => openPreview(rel, e.name, e.size)));
     actions.appendChild(mkAction('下载', 'btn-soft mini', () => {
-      location.href = '/api/download?path=' + encodeURIComponent(rel);
+      location.href = BASE + '/api/download?path=' + encodeURIComponent(rel);
     }));
     actions.appendChild(mkAction('重命名', 'btn-soft mini', () => renameItem(rel, e.name)));
     actions.appendChild(mkAction('移动', 'btn-soft mini', () => moveItem(rel, e.name, e.isDir)));
@@ -625,7 +632,7 @@ window.addEventListener('scroll', () => { scheduleVirtual(); loadListMore(false)
 window.addEventListener('resize', () => scheduleVirtual());
 async function refreshShares() {
   try {
-    const d = await api('/api/shares');
+    const d = await api(BASE + '/api/shares');
     if (!d) return;
     const m = {};
     d.shares.forEach(s => {
@@ -642,13 +649,17 @@ async function refreshShares() {
     sharesMap = m;
   } catch (e) {}
 }
+// 列表请求序号：连续切换目录时，晚到的旧响应不得覆盖新目录的数据
+let listSeq = 0;
 async function loadList(p) {
+  const seq = ++listSeq;
   state.curPath = p || '';
   try { localStorage.setItem('fh-path', state.curPath); } catch (e) {}
   selMap.clear();
-  pageState = { items: [], total: 0, hasMore: false, loading: true, search: false };
+  pageState = { items: [], total: 0, hasMore: false, loading: true, search: false, path: state.curPath };
   try {
-    const d = await fetchList(0);
+    const d = await fetchList(0, state.curPath);
+    if (seq !== listSeq) return; // 已切换到别的目录：过期响应整包丢弃
     if (!d) { pageState.loading = false; return; }
     renderCrumb(d.path);
     d.entries.forEach(e => { e.dirPath = d.path; });
@@ -659,28 +670,41 @@ async function loadList(p) {
     pageState.loading = false;
     renderTable(pageState.items);
   } catch (e) {
+    if (seq !== listSeq) return;
     pageState.loading = false;
+    // 恢复的目录可能已被改名/删除（400/404）：自动回根目录自愈，
+    // 不再停留 在空白表格上且 fh-path 永不清除的旧状态
+    if (state.curPath && (e.status === 400 || e.status === 404)) {
+      try { localStorage.removeItem('fh-path'); } catch (err) {}
+      toast('原目录不可访问，已返回根目录');
+      loadList('');
+      return;
+    }
     toast(e.message);
   }
 }
-// 带排序/筛选/分页参数拉取目录（服务端排序保证跨页次序稳定）
-function fetchList(offset) {
+// 带排序/筛选/分页参数拉取目录（服务端排序保证跨页次序稳定）。
+// path 显式传入：追加下一页时锁定发起时的目录，中途切目录不会串页
+function fetchList(offset, path) {
   const q = new URLSearchParams();
-  q.set('path', state.curPath);
+  q.set('path', path != null ? path : state.curPath);
   q.set('offset', String(offset));
   q.set('limit', String(PAGE_SIZE));
   q.set('sort', (($('#sort-select') || {}).value) || 'time-desc');
   q.set('filter', (($('#filter-select') || {}).value) || 'all');
   q.set('size', (($('#size-select') || {}).value) || 'all');
-  return api('/api/list?' + q.toString());
+  return api(BASE + '/api/list?' + q.toString());
 }
 // 追加下一页（滚动接近底部自动触发；force 供「点击加载更多」）
 async function loadListMore(force) {
   if (pageState.search || pageState.loading || !pageState.hasMore) return;
+  // 目录已切换：旧目录的追加请求直接放弃（旧版会把上一目录的行追加进来，点开 404）
+  if ((pageState.path || '') !== state.curPath) { pageState.hasMore = false; return; }
   if (!force && window.innerHeight + window.scrollY < document.body.scrollHeight - 600) return;
   pageState.loading = true;
   try {
-    const d = await fetchList(pageState.items.length);
+    const d = await fetchList(pageState.items.length, pageState.path);
+    if ((pageState.path || '') !== state.curPath) { pageState.loading = false; return; }
     if (d && d.entries) {
       const seen = new Set(pageState.items.map(x => x.name));
       d.entries.forEach(e => {
@@ -766,7 +790,7 @@ async function runSearch() {
   const sc = $('#search-clear'); if (sc) sc.classList.remove('hidden');
   const title = $('#page-title'); if (title) title.textContent = `搜索“${q}”`;
   try {
-    const d = await api('/api/search?q=' + encodeURIComponent(q));
+    const d = await api(BASE + '/api/search?q=' + encodeURIComponent(q));
     if (!d) return;
     const crumb = $('#crumb');
     if (crumb) crumb.innerHTML = `<span class="cur">全盘搜索 · ${d.results.length} 个结果${d.truncated ? '（已达上限，请细化关键词）' : ''}</span>`;
@@ -798,11 +822,11 @@ async function doMove(from, to, label) {
   if (!to || to === from) return;
   if (to.includes('..')) return toast('路径不合法');
   try {
-    await api('/api/move', {
+    await api(BASE + '/api/move', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ from, to })
     });
-    toast(label + '完成'); refreshShares(); loadList(state.curPath);
+    toast(label + '完成'); await refreshShares(); loadList(state.curPath);
   } catch (e) { toast(e.message); }
 }
 // 重命名：只改名字，保持在原目录
@@ -852,8 +876,8 @@ async function delItem(rel, name, isDir) {
   const ok = await askConfirm('删除确认', `确定删除「${name}」？${isDir ? '将包含其中所有文件，' : ''}删除后进入回收站，可随时恢复。`);
   if (!ok) return;
   try {
-    await api('/api/item?path=' + encodeURIComponent(rel), { method: 'DELETE' });
-    toast('已移入回收站'); refreshShares(); loadList(state.curPath);
+    await api(BASE + '/api/item?path=' + encodeURIComponent(rel), { method: 'DELETE' });
+    toast('已移入回收站'); await refreshShares(); loadList(state.curPath);
   } catch (e) { toast(e.message); }
 }
 function getChecked() {
@@ -918,7 +942,7 @@ on('#batch-share', 'click', async () => {
     const f = files[i];
     if (box) box.innerHTML = `<div class="mgr-empty">正在创建 ${i + 1}/${files.length} …</div>`;
     try {
-      const r = await api('/api/share', {
+      const r = await api(BASE + '/api/share', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: f.path, expireSeconds: 86400, maxDownloads: 0, scheme: 'auto', mode: 'direct' })
       });
@@ -943,7 +967,7 @@ on('#batch-share', 'click', async () => {
     copyAll.style.display = results.some(r => r.ok) ? '' : 'none';
     copyAll.onclick = async () => { toast(await copyText(text) ? '已复制全部链接' : '复制失败'); };
   }
-  refreshShares(); loadList(state.curPath);
+  await refreshShares(); loadList(state.curPath);
 });
 on('#batch-close', 'click', () => { const m = $('#batch-modal'); if (m) m.classList.add('hidden'); });
 // 批量移动：文件夹选择器
@@ -958,15 +982,15 @@ on('#batch-move', 'click', () => {
     for (const s of sel) {
       if (s.isDir && (dir === s.path || dir.startsWith(s.path + '/'))) { fail++; continue; } // 不能移入自身
       try {
-        await api('/api/move', {
+        await api(BASE + '/api/move', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ from: s.path, to: dir ? dir + '/' + s.name : s.name })
         });
         ok++;
       } catch (e) { fail++; }
     }
-    toast(`移动完成：成功 ${ok}${fail ? '，失败 ' + fail : ''}`);
-    refreshShares(); loadList(state.curPath);
+  toast(`移动完成：成功 ${ok}${fail ? '，失败 ' + fail : ''}`);
+  await refreshShares(); loadList(state.curPath);
   });
 });
 // 批量删除
@@ -977,19 +1001,19 @@ on('#batch-del', 'click', async () => {
   let ok = 0, fail = 0;
   for (const s of sel) {
     try {
-      await api('/api/item?path=' + encodeURIComponent(s.path), { method: 'DELETE' });
+      await api(BASE + '/api/item?path=' + encodeURIComponent(s.path), { method: 'DELETE' });
       ok++;
     } catch (e) { fail++; }
   }
   toast(`删除完成：成功 ${ok}${fail ? `，失败 ${fail}` : ''}`);
-  refreshShares(); loadList(state.curPath);
+  await refreshShares(); loadList(state.curPath);
 });
 // 批量打包下载：服务端流式 zip，不占服务器磁盘
 on('#batch-zip', 'click', async () => {
   const sel = getChecked();
   if (!sel.length) return toast('请先勾选要打包的内容');
   try {
-    const r = await fetch('/api/zip', {
+    const r = await fetch(BASE + '/api/zip', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ paths: sel.map(s => s.path) })
     });
@@ -1027,7 +1051,7 @@ async function mkdirAction() {
   const name = await askText('新建文件夹', '', '文件夹名称');
   if (!name) return;
   try {
-    await api('/api/mkdir?path=' + encodeURIComponent(state.curPath), {
+    await api(BASE + '/api/mkdir?path=' + encodeURIComponent(state.curPath), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name })
     });
@@ -1047,6 +1071,8 @@ const CHUNK_SIZE = 4 * 1024 * 1024;      // 每片 4MB
 const CHUNK_RETRY = 3;                   // 单片重试次数
 
 // xhrSend Promise 化 XHR；返回解析后的 JSON，非 2xx 抛错（err.status/err.data 带详情）
+let currentUploadXhr = null;   // 当前在传的 XHR，供「取消上传」中断
+let uploadCancelled = false;   // 取消标志：终止整个上传队列而非仅当前文件
 function xhrSend(xhr, body, onProgress) {
   return new Promise((resolve, reject) => {
     if (xhr.upload) xhr.upload.onprogress = (e) => {
@@ -1063,6 +1089,12 @@ function xhrSend(xhr, body, onProgress) {
       }
     };
     xhr.onerror = () => reject(new Error('网络错误'));
+    xhr.onabort = () => {
+      const err = new Error('已取消上传');
+      err.cancelled = true;
+      reject(err);
+    };
+    currentUploadXhr = xhr;
     xhr.send(body);
   });
 }
@@ -1072,7 +1104,7 @@ async function uploadSimple(file, dirPath, onProgress) {
   const fd = new FormData();
   fd.append('files', file, file.name);
   const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/api/upload?path=' + encodeURIComponent(dirPath));
+  xhr.open('POST', BASE + '/api/upload?path=' + encodeURIComponent(dirPath));
   return xhrSend(xhr, fd, onProgress);
 }
 
@@ -1081,7 +1113,7 @@ async function uploadSimple(file, dirPath, onProgress) {
 // complete 报分片不完整（400+received）时接回分片循环继续补传，
 // 会话丢失（服务重启/目录被删）自动重新 init
 async function uploadChunked(file, dirPath, onProgress) {
-  const init = await api('/api/upload/init', {
+  const init = await api(BASE + '/api/upload/init', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ dir: dirPath, name: file.name, size: file.size })
   });
@@ -1099,11 +1131,12 @@ async function uploadChunked(file, dirPath, onProgress) {
       for (;;) {
         try {
           const xhr = new XMLHttpRequest();
-          xhr.open('PUT', '/api/upload/chunk?id=' + encodeURIComponent(id) + '&offset=' + done);
+          xhr.open('PUT', BASE + '/api/upload/chunk?id=' + encodeURIComponent(id) + '&offset=' + done);
           await xhrSend(xhr, file.slice(done, end), (loaded) => prog(done + loaded));
           done = end;
           break;
         } catch (e) {
+          if (e.cancelled) throw e; // 用户取消：不再重试
           if (e.status === 409 && e.data && typeof e.data.received === 'number') {
             done = Math.min(e.data.received, file.size); // 按服务端真实进度续传
             break;
@@ -1121,7 +1154,7 @@ async function uploadChunked(file, dirPath, onProgress) {
         }
       }
       if (restart) {
-        const again = await api('/api/upload/init', {
+        const again = await api(BASE + '/api/upload/init', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ dir: dirPath, name: file.name, size: file.size })
         });
@@ -1131,7 +1164,7 @@ async function uploadChunked(file, dirPath, onProgress) {
     }
     // 全部字节已送达，请求落盘生效；分片不完整（校验失败）时按服务端进度补传
     try {
-      await api('/api/upload/complete?id=' + encodeURIComponent(id), {
+      await api(BASE + '/api/upload/complete?id=' + encodeURIComponent(id), {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
       });
       return;
@@ -1151,15 +1184,22 @@ function sendFile(file, dirPath, onProgress) {
   return uploadSimple(file, dirPath, onProgress);
 }
 
-// 多文件顺序上传：进度条按「累计字节 / 总字节」推进，单个失败不阻断后续
+// 多文件顺序上传：进度条按「累计字节 / 总字节」推进，单个失败不阻断后续。
+// 上传目录在队列开始时锁定：上传途中点进别的目录，剩余文件仍传进原目录
+// （旧版循环内重读 state.curPath，用户以为上传丢了）
 async function uploadFiles(files) {
   const arr = Array.from(files || []);
   if (!arr.length) return;
+  const dirPath = state.curPath;
   const totalBytes = arr.reduce((s, f) => s + f.size, 0) || 1;
   let sent = 0, ok = 0, fail = 0;
   const failMsgs = [];
+  uploadCancelled = false;
   const card = $('#upload-progress');
-  if (card) card.classList.remove('hidden');
+  if (card) {
+    card.classList.remove('hidden');
+    mountUploadCancel(card);
+  }
   const bar = $('#progress-bar'), pp = $('#progress-pct'), pn = $('#progress-name');
   const paint = (n) => {
     const pct = Math.min(100, Math.round(n / totalBytes * 100));
@@ -1167,25 +1207,52 @@ async function uploadFiles(files) {
     if (pp) pp.textContent = pct + '%';
   };
   for (const f of arr) {
+    if (uploadCancelled) break;
     if (pn) pn.textContent = arr.length > 1 ? `上传 ${ok + fail + 1}/${arr.length}：${f.name}` : f.name;
     try {
-      await sendFile(f, state.curPath, (loaded) => paint(sent + loaded));
+      await sendFile(f, dirPath, (loaded) => paint(sent + loaded));
       ok++;
     } catch (e) {
+      if (e.cancelled) break; // 用户取消：终止整个队列
       fail++;
       failMsgs.push(f.name + (e && e.message ? '：' + e.message : ''));
     }
     sent += f.size;
     paint(sent);
   }
-  setTimeout(() => { if (card) card.classList.add('hidden'); }, 800);
+  currentUploadXhr = null;
+  setTimeout(() => { if (card) card.classList.add('hidden'); unmountUploadCancel(); }, 800);
   if (bar) bar.style.width = '0%';
-  if (fail) {
+  if (uploadCancelled) {
+    toast(`上传已取消：完成 ${ok}${fail ? '，失败 ' + fail : ''}`);
+  } else if (fail) {
     toast(`上传完成：成功 ${ok}，失败 ${fail}（${failMsgs[0] || ''}${failMsgs.length > 1 ? ' 等' : ''}）`);
   } else {
     toast(`上传成功 ${ok} 个文件`);
   }
-  loadList(state.curPath);
+  loadList(dirPath);
+}
+
+// 上传进度卡上的「取消」按钮：中断当前 XHR 并终止队列
+function mountUploadCancel(card) {
+  if ($('#upload-cancel')) return;
+  const btn = document.createElement('button');
+  btn.id = 'upload-cancel';
+  btn.className = 'btn btn-soft mini';
+  btn.style.marginLeft = 'auto';
+  btn.textContent = '取消上传';
+  btn.addEventListener('click', () => {
+    uploadCancelled = true;
+    btn.disabled = true;
+    btn.textContent = '取消中…';
+    try { if (currentUploadXhr) currentUploadXhr.abort(); } catch (e) {}
+  });
+  const head = card.querySelector('.progress-head');
+  if (head) head.appendChild(btn);
+}
+function unmountUploadCancel() {
+  const b = $('#upload-cancel');
+  if (b) b.remove();
 }
 
 // 拖拽
@@ -1263,10 +1330,15 @@ async function uploadFolder(files) {
 // 「上传文件夹」与「拖拽目录上传」共用；进度按累计字节推进
 async function uploadSequence(arr) {
   if (!arr.length) return;
+  const basePath = state.curPath; // 目录锁定：上传途中切目录不串位（同 uploadFiles）
   const totalBytes = arr.reduce((s, it) => s + (it.file.size || 0), 0) || 1;
   let sent = 0, done = 0, fail = 0;
+  uploadCancelled = false;
   const card = $('#upload-progress');
-  if (card) card.classList.remove('hidden');
+  if (card) {
+    card.classList.remove('hidden');
+    mountUploadCancel(card);
+  }
   const bar = $('#progress-bar'), pp = $('#progress-pct'), pn = $('#progress-name');
   const paint = (n) => {
     const pct = Math.min(100, Math.round(n / totalBytes * 100));
@@ -1274,23 +1346,30 @@ async function uploadSequence(arr) {
     if (pp) pp.textContent = pct + '%';
   };
   for (const it of arr) {
+    if (uploadCancelled) break;
     const f = it.file, rp = it.relPath || f.name;
     // relPath 形如 "顶层文件夹/子目录/文件名"（含顶层文件夹名，保留以重建目录结构）
     const idx = rp.lastIndexOf('/');
     const sub = idx > 0 ? rp.slice(0, idx) : '';
-    const target = (state.curPath ? state.curPath + '/' : '') + sub;
+    const target = (basePath ? basePath + '/' : '') + sub;
     if (pn) pn.textContent = `上传文件夹 ${done + fail + 1}/${arr.length}：${f.name}`;
     try {
       await sendFile(f, target, (loaded) => paint(sent + loaded));
       done++;
-    } catch (e) { fail++; }
+    } catch (e) {
+      if (e.cancelled) break;
+      fail++;
+    }
     sent += f.size || 0;
     paint(sent);
   }
-  setTimeout(() => { if (card) card.classList.add('hidden'); }, 800);
+  currentUploadXhr = null;
+  setTimeout(() => { if (card) card.classList.add('hidden'); unmountUploadCancel(); }, 800);
   if (bar) bar.style.width = '0%';
-  toast(`文件夹上传完成：成功 ${done}${fail ? `，失败 ${fail}` : ''}`);
-  loadList(state.curPath);
+  toast(uploadCancelled
+    ? `文件夹上传已取消：完成 ${done}${fail ? `，失败 ${fail}` : ''}`
+    : `文件夹上传完成：成功 ${done}${fail ? `，失败 ${fail}` : ''}`);
+  loadList(basePath);
 }
 // 拖拽目录的入口：walkEntry 展开结果直接进同一管线
 function uploadDropped(items) {
@@ -1318,7 +1397,7 @@ async function openPreview(rel, name, size) {
   const img = $('#preview-img'), vid = $('#preview-video'), aud = $('#preview-audio'), txt = $('#preview-text');
   const m = $('#preview-modal');
   if (!kind || !img || !vid || !aud || !txt || !m) return;
-  const url = '/api/download?path=' + encodeURIComponent(rel);
+  const url = BASE + '/api/download?path=' + encodeURIComponent(rel);
   [img, vid, aud, txt].forEach(el => el.classList.add('hidden'));
   if (kind === 'img') { img.src = url; img.classList.remove('hidden'); }
   else if (kind === 'vid') { vid.src = url; vid.classList.remove('hidden'); }
@@ -1449,6 +1528,20 @@ function openShare(rel, name, size) {
   if (pwInp) { pwInp.value = ''; pwInp.disabled = true; }
   const pwTg = $('#pw-toggle');
   if (pwTg) pwTg.checked = false;
+  // 档位与自定义输入全部复位到默认（1 天 / 不限 / 直链 / 自动协议）：
+  // 旧版不清 #count-custom 与自定义到期开关，给 A 设过「3 次」后为 B
+  // 生成分享，界面显示「不限」实际还是 3 次
+  segState.expire = 86400; segState.count = 0; segState.scheme = 'auto';
+  $$('#seg-expire .seg-item').forEach(x => x.classList.toggle('active', x.dataset.sec === '86400'));
+  $$('#seg-count .seg-item').forEach(x => x.classList.toggle('active', x.dataset.count === '0'));
+  $$('#seg-scheme .seg-item').forEach(x => x.classList.toggle('active', x.dataset.scheme === 'auto'));
+  $$('#seg-mode .seg-item').forEach(x => x.classList.toggle('active', x.dataset.mode === 'direct'));
+  const cc = $('#count-custom');
+  if (cc) cc.value = '';
+  const tg = $('#expire-custom-toggle');
+  if (tg) tg.checked = false;
+  const ec = $('#expire-custom');
+  if (ec) { ec.disabled = true; ec.value = ''; }
   const genBtn = $('#btn-gen');
   if (genBtn) genBtn.textContent = '生成链接';
   $('#share-modal').classList.remove('hidden');
@@ -1456,9 +1549,10 @@ function openShare(rel, name, size) {
 // buildUrl 别名优先：设置了 alias 的分享用 /s/<alias>（token 链接同样有效）
 function buildUrl(token, schemeMode, hostOverride, alias) {
   const curScheme = location.protocol.replace(':', '');
-  const scheme = schemeMode === 'auto' ? curScheme : schemeMode;
+  // 旧记录 scheme 为空串：拼出来是 "://host/..." 坏链接，回退当前协议
+  const scheme = !schemeMode || schemeMode === 'auto' ? curScheme : schemeMode;
   const host = (hostOverride || '').trim() || location.host;
-  return `${scheme}://${host}/s/${alias || token}`;
+  return `${scheme}://${host}${BASE}/s/${alias || token}`;
 }
 on('#btn-gen', 'click', async () => {
   if (!shareTarget) return;
@@ -1467,7 +1561,7 @@ on('#btn-gen', 'click', async () => {
   if (shareTarget.created) {
     const again = await askConfirm('重新生成', '该文件本次已生成过链接，将撤销旧链接并按当前设置生成新链接，继续？');
     if (!again) return;
-    try { await api('/api/share?token=' + encodeURIComponent(shareTarget.created), { method: 'DELETE' }); } catch (e) {}
+    try { await api(BASE + '/api/share?token=' + encodeURIComponent(shareTarget.created), { method: 'DELETE' }); } catch (e) {}
     shareTarget.created = null;
   }
   let expireSeconds = segState.expire;
@@ -1485,7 +1579,7 @@ on('#btn-gen', 'click', async () => {
   const pwInp = $('#share-password');
   const aliasInp = $('#share-alias'), hlTg = $('#share-hotlink');
   try {
-    const r = await api('/api/share', {
+    const r = await api(BASE + '/api/share', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         path: shareTarget.path, expireSeconds, maxDownloads,
@@ -1500,10 +1594,24 @@ on('#btn-gen', 'click', async () => {
     shareTarget.created = r.share.token;
     const url = buildUrl(r.share.token, segState.scheme, $('#host-override').value.trim(), r.share.alias);
     $('#share-url').value = url;
-    // 二维码：纯前端生成，扫码即可访问分享链接
+    // 二维码：纯前端生成，扫码即可访问分享链接。
+    // 绘制前先清画布：超容量抛错时弹窗里不能残留上一个文件的二维码
+    // （曾出现码是旧的、链接文本是新的，扫码下到别的文件）
     const qr = $('#share-qr');
     if (qr) {
-      try { if (window.FHQR) FHQR.draw(qr, url, 3); } catch (e) {}
+      const qctx = qr.getContext && qr.getContext('2d');
+      const clearQr = () => { if (qctx) qctx.clearRect(0, 0, qr.width, qr.height); };
+      clearQr();
+      try { if (window.FHQR) FHQR.draw(qr, url, 3); }
+      catch (e) {
+        clearQr();
+        if (qctx) {
+          qctx.font = '12px sans-serif';
+          qctx.fillStyle = '#98a1b3';
+          qctx.textAlign = 'center';
+          qctx.fillText('二维码生成失败（链接过长）', qr.width / 2, qr.height / 2);
+        }
+      }
     }
     const leftTag = r.share.expiresAt
       ? `<span class="tag orange">${fmtLeft(r.share.expiresAt)}</span>`
@@ -1527,7 +1635,7 @@ on('#btn-gen', 'click', async () => {
     void result.offsetWidth; // 重启动画
     result.classList.add('result-flash');
     $('#btn-gen').textContent = '重新生成';
-    refreshShares();
+    await refreshShares();
   } catch (e) { toast(e.message); }
 });
 on('#btn-copy', 'click', async () => {
@@ -1541,7 +1649,7 @@ async function loadStats() {
   const cv = $('#stats-chart');
   if (!cv) return;
   try {
-    const d = await api('/api/stats');
+    const d = await api(BASE + '/api/stats');
     if (!d) return;
     statsDays = d.days || [];
     drawStatsChart();
@@ -1614,7 +1722,7 @@ async function loadShares() {
   if (!box) return;
   box.innerHTML = '<div class="mgr-empty">加载中…</div>';
   let d;
-  try { d = await api('/api/shares'); } catch (e) { box.innerHTML = `<div class="mgr-empty">${esc(e.message)}</div>`; return; }
+  try { d = await api(BASE + '/api/shares'); } catch (e) { box.innerHTML = `<div class="mgr-empty">${esc(e.message)}</div>`; return; }
   if (!d) return;
   allShares = d.shares || [];
   renderShares();
@@ -1740,7 +1848,7 @@ function renderShares() {
     right.appendChild(mkIconBtn(icoLog, '访问日志', '', () => toggleShareLog(s.token, s.name, el)));
     right.appendChild(mkIconBtn(icoTrash, '撤销分享', 'ico-danger', async () => {
       if (!(await askConfirm('撤销分享', '撤销该分享链接？撤销后链接立即失效。'))) return;
-      await api('/api/share?token=' + encodeURIComponent(s.token), { method: 'DELETE' });
+      await api(BASE + '/api/share?token=' + encodeURIComponent(s.token), { method: 'DELETE' });
       toast('已撤销'); refreshShares(); loadShares(); loadList(state.curPath);
     }));
     el.appendChild(right);
@@ -1818,7 +1926,7 @@ function toggleShareEdit(s, itemEl) {
       }
     }
     try {
-      await api('/api/share/update', {
+      await api(BASE + '/api/share/update', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           token: s.token, expiresAt,
@@ -1852,7 +1960,7 @@ on('#share-batch-revoke', 'click', async () => {
   let ok = 0, fail = 0;
   for (const t of toks) {
     try {
-      await api('/api/share?token=' + encodeURIComponent(t), { method: 'DELETE' });
+      await api(BASE + '/api/share?token=' + encodeURIComponent(t), { method: 'DELETE' });
       ok++;
     } catch (e) { fail++; }
   }
@@ -1865,12 +1973,15 @@ on('#share-batch-revoke', 'click', async () => {
 const geoCache = {};
 async function fetchGeo(ips) {
   const need = [...new Set(ips.filter(ip => ip && !(ip in geoCache)))];
-  if (need.length) {
+  // 后端单批最多查 30 个 IP：一次全量提交时第 31 个起会被截断，
+  // 旧版把没查到的也缓存成空 {}，归属地永远空白。分批请求，每批独立缓存
+  for (let i = 0; i < need.length; i += 30) {
+    const batch = need.slice(i, i + 30);
     try {
-      const d = await api('/api/ipgeo?ips=' + encodeURIComponent(need.join(',')));
-      Object.assign(geoCache, (d && d.geos) || {});
-      need.forEach(ip => { if (!(ip in geoCache)) geoCache[ip] = {}; });
-    } catch (e) { need.forEach(ip => { geoCache[ip] = {}; }); }
+      const d = await api(BASE + '/api/ipgeo?ips=' + encodeURIComponent(batch.join(',')));
+      const geos = (d && d.geos) || {};
+      batch.forEach(ip => { geoCache[ip] = geos[ip] || {}; });
+    } catch (e) { batch.forEach(ip => { geoCache[ip] = {}; }); }
   }
 }
 // 紧凑摘要：湖北·荆门·钟祥·S311 移动；境内 IP 省略「中国」，境外保留国家；
@@ -1915,7 +2026,7 @@ async function toggleShareLog(token, name, itemEl) {
   pane.classList.remove('hidden');
   pane.innerHTML = '<div class="log-ua">加载中…</div>';
   try {
-    const d = await api('/api/sharelog?token=' + encodeURIComponent(token));
+    const d = await api(BASE + '/api/sharelog?token=' + encodeURIComponent(token));
     if (!d) { pane.classList.add('hidden'); return; }
     if (!d.log.length) {
       pane.innerHTML = '<div class="log-ua">还没有访问记录</div>';
@@ -2026,7 +2137,7 @@ async function loadVersionInfo() {
     }
   };
   let r;
-  try { r = await api('/api/version?force=1'); } catch (e) {
+  try { r = await api(BASE + '/api/version?force=1'); } catch (e) {
     setStatus('加载失败：' + esc(e.message));
     if (curBox) curBox.classList.add('hidden');
     if (newBox) newBox.classList.add('hidden');
@@ -2079,7 +2190,7 @@ async function uploadBin(file) {
   try {
     const fd = new FormData();
     fd.append('file', file);
-    await api('/api/selfupdate', { method: 'POST', body: fd });
+    await api(BASE + '/api/selfupdate', { method: 'POST', body: fd });
     pollUpdate(file.name);
   } catch (err) {
     setStatus(`上传失败：${esc(err.message)}`);
@@ -2088,7 +2199,7 @@ async function uploadBin(file) {
 async function doUpdate(latest) {
   setStatus('提交更新任务…');
   try {
-    await api('/api/selfupdate', {
+    await api(BASE + '/api/selfupdate', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({})
     });
@@ -2100,7 +2211,7 @@ async function doUpdate(latest) {
 function pollUpdate(label) {
   const t = setInterval(async () => {
     let s;
-    try { s = await api('/api/selfupdate'); } catch (e) { return; } // 网络抖动继续等
+    try { s = await api(BASE + '/api/selfupdate'); } catch (e) { return; } // 网络抖动继续等
     if (s.status === 'error') {
       clearInterval(t);
       setStatus(`更新失败：${esc(s.message)}`);
@@ -2121,7 +2232,7 @@ function pollUpdate(label) {
       const c = $('#upd-cancel');
       if (c) c.onclick = async () => {
         c.disabled = true; c.textContent = '取消中…';
-        try { await api('/api/selfupdate/cancel', { method: 'POST' }); }
+        try { await api(BASE + '/api/selfupdate/cancel', { method: 'POST' }); }
         catch (e) { c.disabled = false; c.textContent = '取消更新'; toast(e.message); }
       };
     } else {
@@ -2133,7 +2244,7 @@ function pollUpdate(label) {
       const c = $('#upd-cancel');
       if (c) c.onclick = async () => {
         c.disabled = true; c.textContent = '取消中…';
-        try { await api('/api/selfupdate/cancel', { method: 'POST' }); }
+        try { await api(BASE + '/api/selfupdate/cancel', { method: 'POST' }); }
         catch (e) { c.disabled = false; c.textContent = '取消更新'; toast(e.message); }
       };
     }
@@ -2144,7 +2255,7 @@ function waitHealthy(expected) {
   const t = setInterval(async () => {
     n++;
     try {
-      const v = await api('/api/version');
+      const v = await api(BASE + '/api/version');
       clearInterval(t);
       const ok = !expected || v.version === expected;
       setStatus(ok
@@ -2172,7 +2283,7 @@ async function enterTidyView() {
   const st = $('#tidy-status');
   if (st) st.textContent = '加载中…';
   try {
-    const d = await api('/api/tidy');
+    const d = await api(BASE + '/api/tidy');
     if (!d) return;
     const sw = $('#tidy-enabled'), sel = $('#tidy-hours');
     if (sw) sw.checked = d.enabled !== false;
@@ -2203,7 +2314,7 @@ on('#tidy-save', 'click', async () => {
   const hours = sel ? Number(sel.value) : 0;
   if (!hours || hours < 1) return toast('请选择有效的保留时长');
   try {
-    const d = await api('/api/tidy/config', {
+    const d = await api(BASE + '/api/tidy/config', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enabled: sw ? sw.checked : true, hours })
     });
@@ -2217,7 +2328,7 @@ on('#tidy-run', 'click', async () => {
   const st = $('#tidy-status');
   if (st) st.textContent = '清理中…';
   try {
-    const d = await api('/api/tidy', { method: 'POST' });
+    const d = await api(BASE + '/api/tidy', { method: 'POST' });
     if (!d) return;
     if (st) st.textContent = `已清理 ${d.removed} 条记录，当前剩余待清理 ${d.pending} 条。`;
     toast(d.removed > 0 ? `已清理 ${d.removed} 条过期记录` : '没有需要清理的记录');
@@ -2232,7 +2343,7 @@ async function loadSessionsList() {
   if (!box) return;
   box.innerHTML = '<div class="mgr-empty">加载中…</div>';
   let d;
-  try { d = await api('/api/sessions'); } catch (e) { box.innerHTML = `<div class="mgr-empty">${esc(e.message)}</div>`; return; }
+  try { d = await api(BASE + '/api/sessions'); } catch (e) { box.innerHTML = `<div class="mgr-empty">${esc(e.message)}</div>`; return; }
   if (!d) return;
   if (d.enabled === false) {
     box.innerHTML = '<div class="mgr-empty">服务未启用登录认证，无需会话管理。</div>';
@@ -2258,7 +2369,7 @@ async function loadSessionsList() {
       right.appendChild(mkAction('踢出', 'btn-soft mini btn-danger', async () => {
         if (!(await askConfirm('踢出会话', `确定踢出该会话？该浏览器需要重新登录。`))) return;
         try {
-          await api('/api/sessions/kick', {
+          await api(BASE + '/api/sessions/kick', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ id: s.id })
           });
@@ -2277,7 +2388,7 @@ async function loadGeoKeyStatus() {
   const st = $('#geo-key-status');
   if (!st) return;
   try {
-    const d = await api('/api/uapikey');
+    const d = await api(BASE + '/api/uapikey');
     const input = $('#geo-key'), save = $('#geo-key-save'), clear = $('#geo-key-clear');
     if (d.fromEnv) {
       // 环境变量优先级最高，页面改了也不生效，直接锁掉避免误解
@@ -2299,7 +2410,7 @@ on('#geo-key-save', 'click', async () => {
   const v = (input.value || '').trim();
   if (!v) return toast('请先粘贴 Key；如需清空请点「清除」');
   try {
-    const d = await api('/api/uapikey', {
+    const d = await api(BASE + '/api/uapikey', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ key: v })
     });
@@ -2312,7 +2423,7 @@ on('#geo-key-save', 'click', async () => {
 });
 on('#geo-key-clear', 'click', async () => {
   try {
-    const d = await api('/api/uapikey', {
+    const d = await api(BASE + '/api/uapikey', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ key: '' })
     });
@@ -2332,7 +2443,7 @@ on('#pw-save', 'click', async () => {
   if (newPw.length < 6) return toast('新密码至少需要 6 位');
   if (newPw !== newPw2) return toast('两次输入的新密码不一致');
   try {
-    await api('/api/password', {
+    await api(BASE + '/api/password', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ oldPass: oldPw, newPass: newPw })
     });
@@ -2351,7 +2462,7 @@ async function loadTrash() {
   if (!box) return;
   box.innerHTML = '<div class="mgr-empty">加载中…</div>';
   let d;
-  try { d = await api('/api/trash'); } catch (e) { box.innerHTML = `<div class="mgr-empty">${esc(e.message)}</div>`; return; }
+  try { d = await api(BASE + '/api/trash'); } catch (e) { box.innerHTML = `<div class="mgr-empty">${esc(e.message)}</div>`; return; }
   if (!d) return;
   const days = $('#trash-days'); if (days) days.textContent = d.retentionDays || '—';
   trashSel.clear();
@@ -2380,7 +2491,7 @@ async function loadTrash() {
     right.className = 'right-col';
     right.appendChild(mkAction('恢复', 'btn-primary mini', async () => {
       try {
-        const r = await api('/api/trash/restore', {
+        const r = await api(BASE + '/api/trash/restore', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ name: it.name })
         });
@@ -2391,7 +2502,7 @@ async function loadTrash() {
     right.appendChild(mkAction('彻底删除', 'btn-soft mini btn-danger', async () => {
       if (!(await askConfirm('彻底删除', `彻底删除「${it.orig}」？此操作不可恢复。`))) return;
       try {
-        await api('/api/trash/purge', {
+        await api(BASE + '/api/trash/purge', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ name: it.name })
         });
@@ -2426,7 +2537,7 @@ on('#trash-batch-restore', 'click', async () => {
   let ok = 0, fail = 0;
   for (const n of names) {
     try {
-      await api('/api/trash/restore', {
+      await api(BASE + '/api/trash/restore', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: n })
       });
@@ -2443,7 +2554,7 @@ on('#trash-batch-purge', 'click', async () => {
   let ok = 0, fail = 0;
   for (const n of names) {
     try {
-      await api('/api/trash/purge', {
+      await api(BASE + '/api/trash/purge', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: n })
       });
@@ -2456,7 +2567,7 @@ on('#trash-batch-purge', 'click', async () => {
 on('#trash-clear', 'click', async () => {
   if (!(await askConfirm('清空回收站', '彻底删除回收站内的全部内容？此操作不可恢复。'))) return;
   try {
-    const r = await api('/api/trash/clear', {
+    const r = await api(BASE + '/api/trash/clear', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: '{}'
     });

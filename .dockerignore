@@ -1,0 +1,12 @@
+# 构建镜像只需要 go.mod / *.go / public/，其余一律不进构建上下文
+.git
+.github
+.workbuddy
+dist
+dist-go
+data
+files
+deploy
+*.md
+install-remote.sh
+build.sh

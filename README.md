@@ -118,6 +118,7 @@ docker compose up -d      # 多阶段构建，数据落在 ./files 与 ./data
 ```
 
 `docker-compose.yml` 默认只监听 `127.0.0.1:16666`，由 Nginx/Caddy 反代后对外。
+`.env` 里的 `AUTH_PASS` 会经 `${AUTH_PASS:-...}` 插值注入容器，**务必改成强密码**（默认值仅作占位）。
 
 ## 手动 systemd + Nginx
 
