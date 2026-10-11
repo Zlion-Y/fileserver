@@ -74,7 +74,7 @@ var (
 
 // 注意：必须是 var 而非 const，否则 -ldflags "-X main.version=..." 注入不会生效
 var (
-	version   = "1.5.0"
+	version   = "1.6.0"
 	commit    = "unknown" // 构建时由 -ldflags 注入
 	buildTime = "unknown"
 	// changelogB64 当前版本更新日志（base64）。CI 构建时把上一 tag 到本 tag 的
@@ -2072,11 +2072,34 @@ func checkAuth(w http.ResponseWriter, r *http.Request) bool {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "WebDAV 需要登录（用户名/密码同管理端）"})
 		return false
 	}
-	// 分享链接、健康检查免密；登录流程自身免密；静态页面公开（数据全部走 API，页面本身无敏感内容）
+	// 分享链接、健康检查免密；登录流程自身免密
 	if strings.HasPrefix(p, "/s/") || p == "/healthz" ||
-		p == "/login" || p == "/api/login" || p == "/api/logout" ||
-		!strings.HasPrefix(p, "/api/") {
+		p == "/login" || p == "/api/login" || p == "/api/logout" {
 		return true
+	}
+	// 管理界面与静态资源：未登录一律 302 到登录页。
+	// 旧实现页面壳公开——虽然数据全走 API，但后台的菜单结构、按钮布局、
+	// 全部 API 端点都写在 index.html 与 app.js 里，等于向未登录访客
+	// 公开管理界面的完整轮廓，也方便攻击者按图索骥。现与登录页统一：
+	// 未登录只能看到 /login
+	if !strings.HasPrefix(p, "/api/") {
+		ip := clientIP(r)
+		if ms := banRemaining(ip); ms > 0 {
+			w.Header().Set("Retry-After", strconv.FormatInt(ms/1000+1, 10))
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return false
+		}
+		if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" && validSession(c.Value) {
+			return true
+		}
+		u, pw, hasBasic := r.BasicAuth()
+		if hasBasic &&
+			subtle.ConstantTimeCompare([]byte(u), []byte(flagUser)) == 1 &&
+			checkPass(pw) {
+			return true
+		}
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return false
 	}
 	ip := clientIP(r)
 	if ms := banRemaining(ip); ms > 0 {
