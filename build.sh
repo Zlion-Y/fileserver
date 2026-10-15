@@ -11,7 +11,9 @@
 set -euo pipefail
 
 NAME="fileserver"
-VERSION="${VERSION:-v1.0.0}"
+# 版本号默认取自最近的 tag：写死 v1.0.0 会让每次本地构建都自称 v1.0.0，
+# 而页面上的「检查更新」拿它和真实 Release 比，永远提示「有新版可更新」
+VERSION="${VERSION:-$(git describe --tags --abbrev=0 2>/dev/null || echo dev)}"
 OUT="${OUT:-dist-go}"
 GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -26,6 +28,7 @@ linux/arm/5
 linux/386
 linux/mipsle
 windows/amd64
+darwin/amd64
 darwin/arm64
 "
 PLATFORMS="${PLATFORMS:-$DEFAULT_PLATFORMS}"
@@ -78,7 +81,11 @@ done
 echo
 echo "产物目录: $OUT"
 ls -lh "$OUT" | tail -n +2 | awk '{printf "  %-28s %s\n", $9, $5}'
+# 与 release.yml 同名同格式的校验文件：装机脚本和使用者都要能验完整性
+( cd "$OUT" && sha256sum ${NAME}_* > SHA256SUMS && echo "已生成 $OUT/SHA256SUMS" )
 echo
 echo "运行示例（Linux 服务器）:"
 echo "  scp $OUT/${NAME}_linux_amd64 root@server:/usr/local/bin/fileserver"
-echo "  ssh root@server 'chmod +x /usr/local/bin/fileserver && fileserver --port 16666 --dir /data/files --user admin --pass 123456'"
+echo "  ssh root@server 'chmod +x /usr/local/bin/fileserver && fileserver --port 16666 --dir /data/files --user admin'"
+echo "  # 口令不要用 --pass 传（会出现在 ps 里）：改用环境变量 AUTH_PASS，"
+echo "  #   或在 systemd/环境文件里给；--user/--pass 只是为了临时试跑"

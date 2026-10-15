@@ -6,6 +6,10 @@ on: [push, pull_request]
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    # 这个 job 会编译并「运行」PR 作者的代码。默认 token 权限（公开仓库常是
+    # read and write）一旦被仓库设置放开，就等于任何 PR 都能拿走可写的 GITHUB_TOKEN
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

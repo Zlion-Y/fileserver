@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-base="/">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -63,35 +63,6 @@ button:disabled { opacity: .5; cursor: default; }
     <div class="err" id="err"></div>
   </form>
 </div>
-<script>
-'use strict';
-const form = document.getElementById('form');
-const btn = document.getElementById('btn');
-const err = document.getElementById('err');
-
-form.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const user = document.getElementById('user').value.trim();
-  const pass = document.getElementById('pass').value;
-  if (!user || !pass) { err.textContent = '请输入用户名和密码'; return; }
-  btn.disabled = true; err.textContent = '';
-  try {
-    const r = await fetch('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user: user, pass: pass })
-    });
-    const d = await r.json().catch(() => ({}));
-    if (r.ok) {
-      location.href = '/';
-      return;
-    }
-    err.textContent = d.error || ('登录失败 ' + r.status);
-  } catch (ex) {
-    err.textContent = '网络错误，请重试';
-  }
-  btn.disabled = false;
-});
-</script>
+<script src="login.js"></script>
 </body>
 </html>

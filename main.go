@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"embed"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -73,10 +72,14 @@ var (
 
 // verNums 把 "v1.2.3" 解析成 [1,2,3]（无法解析的段按 0 处理）
 var (
+	// 唯一的 HTTP 服务实例：自更新重启前需要它能被主动 Shutdown
+	httpSrv *http.Server
+
 	updStatusMu sync.Mutex
 	updStatus   = "idle"
 	updMsg      = ""
 	updBusy     int32
+	updEpoch    int64 // updBusy 持有者的代号，见 updAcquire/updRelease
 	updCancel   int32 // 置 1 请求取消（仅 downloading 阶段有效）
 	updDone     int64 // 已下载字节数
 	updTotal    int64 // 总字节数（Content-Length；未知为 -1）
@@ -86,6 +89,9 @@ const (
 	pbkdf2Prefix = "pbkdf2$"
 	authIter     = 100000 // 管理端密码：登录频率极低，可以用较高迭代
 	shareIter    = 50000  // 分享密码：每次下载都要校验，路由器等弱设备上适度下调
+	// 校验时接受的迭代次数上限：iter 存在哈希记录里、由 config.json/shares.json 提供，
+	// 不设限等于让"能写数据文件的人"决定每次登录消耗多少 CPU
+	maxPbkdf2Iter = 1000000
 	// 各命名空间前缀，避免管理密码与分享密码的存储串可互换
 	nsAuth  = "fs-auth:"
 	nsShare = "fs-pw:"
@@ -98,10 +104,18 @@ var (
 	masterKeyErr  error
 )
 
-// pwMasterKey 返回分享密码加密主密钥：优先 FS_MASTER_KEY 环境变量，
-// 否则在 data 目录维护一个 0600 的随机密钥文件
+// clientScheme 判断客户端眼中的协议，用于会话 Cookie 的 Secure 与 HSTS。
+// 本程序自身不监听 TLS，所以 r.TLS 恒为 nil；只看反代头又会漏掉两类部署：
+// 「TLS 由代理终结但未开 TRUST_PROXY」时 Secure 与 HSTS 永不下发，
+// 会话 token 可被链路上任何明文请求或降级带走。故：本机直连 TLS（未来/第三方
+// 转发）、显式 COOKIE_SECURE=1、可信代理声明的 X-Forwarded-Proto 三处任一成立即 https
+var cookieSecureForce = envBool("COOKIE_SECURE", false)
+
 func clientScheme(r *http.Request) string {
-	if flagProxy {
+	if r.TLS != nil || cookieSecureForce {
+		return "https"
+	}
+	if peerIsTrustedProxy(r) {
 		if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
 			return strings.TrimSpace(strings.Split(p, ",")[0])
 		}
@@ -109,20 +123,14 @@ func clientScheme(r *http.Request) string {
 	return "http"
 }
 func clientHost(r *http.Request) string {
-	if flagProxy {
-		// 与 clientIP 同一信任模型：仅当直连来源本身是可信代理时才采信
+	if peerIsTrustedProxy(r) {
+		// 与 clientIP 同一信任模型：仅当直连来源确实是我们配置的代理时才采信
 		// 转发头，否则任何人都能用 X-Forwarded-Host 把钓鱼域名拼进分享链接
-		host := r.RemoteAddr
-		if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-			host = h
-		}
-		if isTrustedProxyPeer(host) {
-			if h := r.Header.Get("X-Forwarded-Host"); h != "" {
-				h = strings.TrimSpace(strings.Split(h, ",")[0])
-				// host 会原样拼进 URL，含分隔符/空白即可注入，一律拒收
-				if h != "" && !strings.ContainsAny(h, " \t/\\?#@") {
-					return h
-				}
+		if h := r.Header.Get("X-Forwarded-Host"); h != "" {
+			h = strings.TrimSpace(strings.Split(h, ",")[0])
+			// host 会原样拼进 URL，含分隔符/空白即可注入，一律拒收
+			if h != "" && !strings.ContainsAny(h, " \t/\\?#@") {
+				return h
 			}
 		}
 	}
@@ -143,7 +151,7 @@ const (
 	banDurationMs = 15 * 60 * 1000 // 封禁时长：15 分钟
 )
 
-// clientIP 取真实来源 IP（反代模式下优先 X-Real-IP，其次 XFF 末段）
+// 会话表：token → 会话信息，落盘 sessions.json，过期项由 startBanGC 回收
 var (
 	sessMu   sync.Mutex
 	sessions = map[string]*sessInfo{}
@@ -159,7 +167,6 @@ var (
 	dlTickets  = map[string]dlTicketRec{}
 )
 
-// newDlTicket 签发随机 ticket 并绑定分享 token
 func (c *countingWriter) Write(p []byte) (int, error) {
 	n, err := c.ResponseWriter.Write(p)
 	c.n += int64(n)
@@ -173,7 +180,7 @@ func (c *countingWriter) Flush() {
 	}
 }
 
-// dlTicketValid 读取请求里的下载授权 Cookie，校验其是否有效且属于该分享
+// 分片上传的临时文件命名与限额
 const (
 	uploadTempPrefix = ".fup-"
 	uploadTempSuffix = ".part"
@@ -221,9 +228,10 @@ const (
 )
 
 var (
-	previewMu    sync.Mutex
-	previewDone  = map[string]bool{}
-	previewFull  = errors.New("完整预览已获取过，请通过下载按钮获取文件")
+	previewMu sync.Mutex
+	// 每个 token|ip 已通过的 inline 预览字节数。用布尔「只放行一次」是拦不住的
+	// （见 previewAllow），按字节记账才能给「看一眼」留额度、又不允许无限次回捞
+	previewBytes = map[string]int64{}
 	previewMaxIP = 8192 // 防 map 无限增长的上限
 )
 
@@ -238,12 +246,18 @@ func main() {
 	flag.StringVar(&flagDir, "dir", os.Getenv("ROOT_DIR"), "文件根目录（预设后无需网页配置）")
 	flag.StringVar(&flagDataDir, "data-dir", envStr("DATA_DIR", defaultDataDir()), "配置与分享记录存放目录")
 	flag.StringVar(&flagUser, "user", os.Getenv("AUTH_USER"), "管理端用户名（Basic 认证）")
-	flag.StringVar(&flagPass, "pass", os.Getenv("AUTH_PASS"), "管理端密码")
+	// -pass 的默认值不能在 flag 注册时取 AUTH_PASS：那样 `fileserver -h`
+	// 会把真实口令原样打印到 stdout（systemd 下进 journal，journal 常可读），
+	// 帮助文本里也会带着生产密码。Parse 之后再补默认值
+	flag.StringVar(&flagPass, "pass", "", "管理端密码（默认取 AUTH_PASS 环境变量，不在 -h 中回显）")
 	flag.BoolVar(&flagProxy, "trust-proxy", envBool("TRUST_PROXY", false), "信任反向代理头 X-Forwarded-*")
 	flag.Int64Var(&flagMaxMB, "max-upload-mb", int64(envInt("MAX_UPLOAD_MB", 0)), "单文件上传上限(MB)，0 不限制")
 	flag.BoolVar(&flagLog, "log", envBool("LOG", true), "输出访问日志")
 	showVer := flag.Bool("version", false, "打印版本信息后退出")
 	flag.Parse()
+	if flagPass == "" {
+		flagPass = os.Getenv("AUTH_PASS")
+	}
 
 	if *showVer {
 		fmt.Printf("fileserver %s\n  commit:    %s\n  built:     %s\n  repo:      https://github.com/%s\n",
@@ -266,6 +280,17 @@ func main() {
 	if flagUser == "" && flagPass != "" {
 		fmt.Println("错误：只设置了 -pass/AUTH_PASS 而未设置 -user/AUTH_USER，认证不会生效。")
 		fmt.Println("      请同时设置两者。")
+		os.Exit(1)
+	}
+	// 第三种组合此前没有任何校验：网页改过密（config.json 里有哈希）之后，
+	// 只要某次启动把 AUTH_USER 弄丢（env 文件被改、裸跑二进制、installer 的非
+	// systemd 分支），checkAuth 会因为 flagUser == "" 无条件放行 —— 哈希还在、
+	// 看起来"密码仍生效"，实际全部 /api（含 /api/selfupdate：写二进制并 exec）
+	// 彻底裸奔。宁可拒绝启动，也不能带着这个状态上线
+	if flagUser == "" && authRecord() != "" {
+		fmt.Println("错误：data/config.json 里存有管理密码哈希，但 -user/AUTH_USER 为空。")
+		fmt.Println("      此时认证会整体失效（所有管理接口匿名可访问）。")
+		fmt.Println("      请设置 AUTH_USER，或删除 config.json 中的 authPassHash 以明确关闭认证。")
 		os.Exit(1)
 	}
 	// ROOT_DIR/-dir 仅作为首次初始化的默认值：
@@ -302,30 +327,62 @@ func main() {
 	startBanGC()       // 认证失败记录的定期清理
 	startTidy()        // 过期分享记录的定期清理
 	startSharesFlush() // 失败访问日志的批量落盘
+	// 上一次进程留下的分片临时文件（会话表不在磁盘上，重启即失忆）：
+	// 异步扫一遍，不阻塞监听
+	if root, err := getRoot(); err == nil {
+		go sweepUploadTemps(root)
+	}
 
-	srv := &http.Server{
+	httpSrv = &http.Server{
 		Addr:              addr,
 		Handler:           http.HandlerFunc(handler),
 		ReadHeaderTimeout: 30 * time.Second,
 		// 只加 IdleTimeout 收闲连接；不设 WriteTimeout——
-		// 大文件下载是长流式响应，设了会把慢速下载掐断
+		// 大文件下载是长流式响应，设了会把慢速下载掐断。
+		// 同样不设 ReadTimeout：大体积上传本来就是长耗时请求体，
+		// 设了会把慢链路上的合法上传截断
 		IdleTimeout: 120 * time.Second,
 	}
 	// 优雅关闭：在途下载/tidy 被硬切会丢状态；先停接新请求，
-	// 给在途请求最多 10 秒收尾，并刷掉未落盘的分享日志
+	// 给在途请求最多 10 秒收尾，并刷掉未落盘的分享日志。
+	// 信号要循环取：旧实现只读一个信号，Shutdown 卡在慢请求上时
+	// 第二次 Ctrl-C 完全无效，只能 kill -9（等于前面想要的优雅关闭全废）
 	go func() {
-		sig := make(chan os.Signal, 1)
+		sig := make(chan os.Signal, 2)
 		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-		<-sig
-		log.Println("[退出] 收到退出信号，正在等待在途请求结束…")
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(ctx)
+		for s := range sig {
+			log.Printf("[退出] 收到 %s，正在等待在途请求结束…（再按一次立即退出）", s)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			done := make(chan struct{})
+			go func() {
+				_ = httpSrv.Shutdown(ctx)
+				close(done)
+			}()
+			select {
+			case <-done:
+				cancel()
+				return
+			case <-time.After(10 * time.Second):
+				cancel()
+				log.Println("[退出] 在途请求未在 10 秒内结束，强制退出")
+				flushSharesOnExit()
+				os.Exit(1)
+			}
+		}
 	}()
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 	flushSharesOnExit()
+}
+
+// shutdownServer 供自更新在 exec 前自行收尾：syscall.Exec 直接替换进程映像，
+// 上面的信号协程与 deferred flushSharesOnExit 都不会跑到
+func shutdownServer(ctx context.Context) {
+	if httpSrv == nil {
+		return
+	}
+	_ = httpSrv.Shutdown(ctx)
 }
 
 // 默认数据目录：可执行文件同级目录下的 data/。

@@ -234,6 +234,13 @@ const dirState = { cur: '' }; // 修改目录视图 / 设置页浏览的当前�
 async function loadDir(p, crumbSel, listSel, st) {
   st = st || dirState;
   st.cur = p;
+  // 移动选择器的「目标目录」标签要随当前目录实时变化：
+  // openMovePicker 只在打开时写过一次 '…'，此后无人更新，用户点「移动到当前目录」
+  // 时完全看不见落点是哪里（真正生效的是 moveState.cur）
+  if (st === moveState) {
+    const tg = $('#move-target');
+    if (tg) tg.textContent = p || (state.rootDir ? state.rootDir + '（根）' : '未选择目录');
+  }
   const d = await api(BASE + '/api/browse?path=' + encodeURIComponent(p));
   if (!d) return;
   const c = $(crumbSel), list = $(listSel);
@@ -656,7 +663,7 @@ async function loadList(p) {
   state.curPath = p || '';
   try { localStorage.setItem('fh-path', state.curPath); } catch (e) {}
   selMap.clear();
-  pageState = { items: [], total: 0, hasMore: false, loading: true, search: false, path: state.curPath };
+  pageState = { items: [], total: 0, hasMore: false, loading: true, search: false, path: state.curPath, offset: 0 };
   try {
     const d = await fetchList(0, state.curPath);
     if (seq !== listSeq) return; // 已切换到别的目录：过期响应整包丢弃
@@ -665,6 +672,7 @@ async function loadList(p) {
     d.entries.forEach(e => { e.dirPath = d.path; });
     state.entries = d.entries;
     pageState.items = d.entries;
+    pageState.offset = d.entries.length;
     pageState.total = d.total != null ? d.total : d.entries.length;
     pageState.hasMore = !!d.hasMore;
     pageState.loading = false;
@@ -703,9 +711,13 @@ async function loadListMore(force) {
   if (!force && window.innerHeight + window.scrollY < document.body.scrollHeight - 600) return;
   pageState.loading = true;
   try {
-    const d = await fetchList(pageState.items.length, pageState.path);
+    // 偏移量必须按「服务端返回的条数」推进，不能用本地已去重的 items.length：
+    // 期间目录里有增删时服务端排序会整体位移，用 items.length 会跳行/重复，
+    // items 永远追不上 total，「加载更多」卡住
+    const d = await fetchList(pageState.offset, pageState.path);
     if ((pageState.path || '') !== state.curPath) { pageState.loading = false; return; }
     if (d && d.entries) {
+      pageState.offset += d.entries.length;
       const seen = new Set(pageState.items.map(x => x.name));
       d.entries.forEach(e => {
         e.dirPath = d.path;
@@ -794,6 +806,12 @@ async function runSearch() {
     if (!d) return;
     const crumb = $('#crumb');
     if (crumb) crumb.innerHTML = `<span class="cur">全盘搜索 · ${d.results.length} 个结果${d.truncated ? '（已达上限，请细化关键词）' : ''}</span>`;
+    // 切换可见行集时必须清空选择：selMap 原先只在 loadList / 取消选择里清空，
+    // 于是「在 A 目录勾了几行 → 去搜索」后批量栏仍显示已选 N 项，
+    // 而显示的行一个都没勾上，此时点批量删除/批量分享/打包下载
+    // 作用的是用户已经看不见的 A 目录路径
+    selMap.clear();
+    updateBatchUI();
     renderTable(d.results, { search: true });
   } catch (e) { toast(e.message); }
 }
@@ -909,6 +927,12 @@ on('#check-all', 'change', () => {
       const rel = pageState.search ? e.path : joinPath(e.dirPath || '', e.name);
       selMap.set(rel, { path: rel, name: e.name, isDir: !!e.isDir });
     });
+    // 分页未取完时勾选框看起来是「全选」，实际只覆盖已加载的那几百行：
+    // 3000 项的目录里点批量删除/分享，用户以为作用于整个目录。
+    // 后端每页 PAGE_SIZE=500、上限 5000，这个落差是常态而非边角
+    if (pageState.hasMore) {
+      toast(`仅选中已加载的 ${selMap.size} 项，该目录还有未加载的内容`);
+    }
   } else {
     selMap.clear();
   }
@@ -1022,13 +1046,29 @@ on('#batch-zip', 'click', async () => {
       try { const j = await r.json(); if (j && j.error) msg = j.error; } catch (e) {}
       return toast(msg);
     }
+    const fname = sel.length === 1 ? sel[0].name + '.zip' : 'files.zip';
+    // 后端是流式 zip（单次可达 2000 项、无体积上限），blob() 会把整包灌进标签页内存，
+    // 选得多就直接把页面撑崩。支持文件选择器的浏览器改为直接写盘
+    if (window.showSaveFilePicker) {
+      try {
+        const fh = await window.showSaveFilePicker({ suggestedName: fname });
+        await r.body.pipeTo(fh.createWritable());
+        toast('ZIP 已写入所选文件；若有个别条目未能打包，压缩包内会附「_打包失败.txt」');
+        return;
+      } catch (e) {
+        if (e && e.name === 'AbortError') return; // 用户取消了保存对话框
+        // 其余失败（如权限/磁盘）落回下面的 blob 路径
+      }
+    }
     const blob = await r.blob();
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = sel.length === 1 ? sel[0].name + '.zip' : 'files.zip';
+    a.download = fname;
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 30000);
-    toast('已开始下载 ZIP');
+    // 服务端出错时头已经发了 200，无法再改状态码：缺哪些项写在包内的
+    // _打包失败.txt 里，这里如实提醒，不再报「已开始下载」这种无条件成功
+    toast('已开始下载 ZIP；如包内有 _打包失败.txt，说明有部分条目未打包成功');
   } catch (e) { toast(e.message); }
 });
 // 点击分享状态标签 → 跳转分享管理并定位该条目
@@ -1073,6 +1113,18 @@ const CHUNK_RETRY = 3;                   // 单片重试次数
 // xhrSend Promise 化 XHR；返回解析后的 JSON，非 2xx 抛错（err.status/err.data 带详情）
 let currentUploadXhr = null;   // 当前在传的 XHR，供「取消上传」中断
 let uploadCancelled = false;   // 取消标志：终止整个上传队列而非仅当前文件
+// 进度卡延后 800ms 收起的那个定时器必须可撤销：新一轮上传在 800ms 内开始时，
+// mountUploadCancel 因按钮还在而提前返回，随后这个陈旧定时器却把卡片隐藏、
+// 并把唯一的「取消」按钮摘掉 —— 队列还在传却再也无法取消
+let uploadHideTimer = 0;
+function hideUploadCardSoon(card) {
+  clearTimeout(uploadHideTimer);
+  uploadHideTimer = setTimeout(() => {
+    uploadHideTimer = 0;
+    if (card) card.classList.add('hidden');
+    unmountUploadCancel();
+  }, 800);
+}
 function xhrSend(xhr, body, onProgress) {
   return new Promise((resolve, reject) => {
     if (xhr.upload) xhr.upload.onprogress = (e) => {
@@ -1197,6 +1249,7 @@ async function uploadFiles(files) {
   uploadCancelled = false;
   const card = $('#upload-progress');
   if (card) {
+    clearTimeout(uploadHideTimer); // 撤销上一轮遗留的隐藏/摘按钮定时器
     card.classList.remove('hidden');
     mountUploadCancel(card);
   }
@@ -1221,7 +1274,7 @@ async function uploadFiles(files) {
     paint(sent);
   }
   currentUploadXhr = null;
-  setTimeout(() => { if (card) card.classList.add('hidden'); unmountUploadCancel(); }, 800);
+  hideUploadCardSoon(card);
   if (bar) bar.style.width = '0%';
   if (uploadCancelled) {
     toast(`上传已取消：完成 ${ok}${fail ? '，失败 ' + fail : ''}`);
@@ -1336,6 +1389,7 @@ async function uploadSequence(arr) {
   uploadCancelled = false;
   const card = $('#upload-progress');
   if (card) {
+    clearTimeout(uploadHideTimer); // 撤销上一轮遗留的隐藏/摘按钮定时器
     card.classList.remove('hidden');
     mountUploadCancel(card);
   }
@@ -1364,7 +1418,7 @@ async function uploadSequence(arr) {
     paint(sent);
   }
   currentUploadXhr = null;
-  setTimeout(() => { if (card) card.classList.add('hidden'); unmountUploadCancel(); }, 800);
+  hideUploadCardSoon(card);
   if (bar) bar.style.width = '0%';
   toast(uploadCancelled
     ? `文件夹上传已取消：完成 ${done}${fail ? `，失败 ${fail}` : ''}`
@@ -1391,6 +1445,19 @@ function extKindOf(name) {
 const TXT_EXT = ['TXT','MD','LOG','JSON','CSV','XML','YML','YAML','INI','CONF','CFG','TOML',
   'SH','BASH','PY','JS','TS','CSS','HTML','HTM','GO','C','CPP','H','JAVA','SQL','BAT','PS1','ENV','SERVICE'];
 const TXT_PREVIEW_MAX = 2 * 1024 * 1024; // 超过 2MB 只取前 2MB，避免大日志撑爆浏览器
+// 文本预览的并发防护：openPreview 可被连续调用（切文件、关了再开），
+// 旧实现既不取消上一次的分块读取也没有序号，被丢弃的 reader 会继续拉满 2MB，
+// 最后把 A 文件的内容写进已经换成 B 的预览面板
+let previewSeq = 0;
+let previewAbort = null;
+
+function abortPreviewFetch() {
+  previewSeq++;
+  if (previewAbort) {
+    try { previewAbort.abort(); } catch (e) {}
+    previewAbort = null;
+  }
+}
 
 async function openPreview(rel, name, size) {
   const kind = extKindOf(name);
@@ -1407,8 +1474,13 @@ async function openPreview(rel, name, size) {
     // 不能用 arrayBuffer() 一口读完——大"文本"（日志/CSV）会把整个文件灌进内存
     txt.classList.remove('hidden');
     txt.textContent = '加载中…';
+    abortPreviewFetch();
+    const mySeq = previewSeq;
+    const ac = new AbortController();
+    previewAbort = ac;
+    const stale = () => mySeq !== previewSeq;
     try {
-      const resp = await fetch(url, { headers: { Range: 'bytes=0-' + (TXT_PREVIEW_MAX - 1) } });
+      const resp = await fetch(url, { headers: { Range: 'bytes=0-' + (TXT_PREVIEW_MAX - 1) }, signal: ac.signal });
       if (!resp.ok && resp.status !== 206) throw new Error('读取失败 ' + resp.status);
       // 206 = 服务端确认只回前 2MB；200 = 拿到了整个文件，总长看 Content-Length
       let total = 0;
@@ -1436,8 +1508,9 @@ async function openPreview(rel, name, size) {
       if (truncated) {
         text += `\n\n…（文件过大，仅显示前 ${fmtSize(got)}${total ? `，共 ${fmtSize(total)}` : ''}）`;
       }
-      txt.textContent = text;
+      if (!stale()) txt.textContent = text;
     } catch (e) {
+      if (stale()) return;
       txt.textContent = '文本预览失败：' + e.message;
     }
   }
@@ -1447,6 +1520,7 @@ async function openPreview(rel, name, size) {
   m.classList.remove('hidden');
 }
 function closePreview() {
+  abortPreviewFetch();
   const m = $('#preview-modal');
   if (!m || m.classList.contains('hidden')) return;
   m.classList.add('hidden');
@@ -1505,7 +1579,13 @@ on('#expire-custom-toggle', 'change', (e) => {
     $$('#seg-expire .seg-item').forEach(x => x.classList.remove('active'));
   } else {
     const chip = $('#seg-expire .seg-item.active') || $$('#seg-expire .seg-item')[2];
-    if (chip) chip.classList.add('active');
+    if (chip) {
+      chip.classList.add('active');
+      // 高亮谁就必须让提交值同步跟上：此前只改视觉，之前选过「永久」(data-sec=0)
+      // 的人取消勾选后看到的是「1 天」，而 POST 仍发 expireSeconds: 0 ——
+      // 与上面「点预设档位要退出自定义模式」是同一类 UI/状态脱节
+      segState.expire = Number(chip.dataset.sec);
+    }
   }
 });
 // 访问密码开关：默认收起，开关打开才可输入，减少无密码分享时的视觉噪音
@@ -1875,7 +1955,7 @@ function toggleShareEdit(s, itemEl) {
         <option value="86400">1 天</option>
         <option value="604800">7 天</option>
         <option value="2592000">30 天</option>
-        <option value="forever">永久</option>
+        <option value="forever"${s.expiresAt ? '' : ' selected'}>永久</option>
         <option value="custom"${s.expiresAt ? ' selected' : ''}>自定义…</option>
       </select>
       <input type="datetime-local" class="input-sm${s.expiresAt ? '' : ' hidden'}" id="se-expire-custom-${s.token}" value="${dtLocal}">
@@ -2175,8 +2255,16 @@ async function loadVersionInfo() {
       online.onclick = () => doUpdate(r.latest);
     }
     if (dl) {
-      dl.href = r.assetUrl || r.releaseUrl;
-      dl.classList.remove('hidden');
+      // releaseUrl 是 GitHub API 的 html_url 原样透传，服务端没有协议白名单；
+      // 直接塞进 <a href> 时一个 javascript:/data: 值就会在点击时执行
+      // （CSP 的 script-src 管不到 javascript: 导航）
+      const target = [r.assetUrl, r.releaseUrl].find(u => typeof u === 'string' && /^https?:\/\//i.test(u));
+      if (target) {
+        dl.href = target;
+        dl.classList.remove('hidden');
+      } else {
+        dl.classList.add('hidden');
+      }
     }
   } else {
     if (newBox) newBox.classList.add('hidden');
@@ -2208,18 +2296,44 @@ async function doUpdate(latest) {
     setStatus(`更新启动失败：${esc(err.message)}`);
   }
 }
+// 更新相关的两个轮询都必须单实例：旧实现把 setInterval 的句柄留在闭包里、
+// 切视图或再次点击「检查更新/一键更新」时不清理，于是叠出多个 1s/2s 轮询，
+// 各自往同一块 setStatus 里写（后写者胜），进度条来回跳
+let updTimer = 0;
+let healthyTimer = 0;
+function clearUpdateTimers() {
+  clearInterval(updTimer); updTimer = 0;
+  clearInterval(healthyTimer); healthyTimer = 0;
+}
 function pollUpdate(label) {
-  const t = setInterval(async () => {
+  clearUpdateTimers();
+  let misses = 0;
+  updTimer = setInterval(async () => {
     let s;
     try { s = await api(BASE + '/api/selfupdate'); } catch (e) { return; } // 网络抖动继续等
+    // api() 在 401/409 时返回 null（会话过期、或有别的任务在跑）：
+    // 旧实现直接解引用 s.status，每秒抛一个未捕获的 TypeError 且定时器永不解除
+    if (!s) {
+      if (++misses > 30) { clearInterval(updTimer); updTimer = 0; setStatus('更新状态已不可查询，请刷新页面'); }
+      return;
+    }
+    misses = 0;
+    const stop = () => { clearInterval(updTimer); updTimer = 0; };
     if (s.status === 'error') {
-      clearInterval(t);
+      stop();
       setStatus(`更新失败：${esc(s.message)}`);
-    } else if (s.status === 'restarting' || s.status === 'done') {
-      clearInterval(t);
-      waitHealthy(s.status === 'restarting' ? null : label);
+    } else if (s.status === 'restarting') {
+      stop();
+      waitHealthy(null); // 真的会换进程重启：只等它重新应答
+    } else if (s.status === 'done') {
+      // Windows / 手动路径：服务端明说「二进制已更新，请手动重启服务进程」，
+      // 进程其实还跑在旧二进制上。旧实现把它当重启完成去做版本比对
+      // （uploadBin 传进来的还是文件名），最后必报「等待服务恢复超时」
+      stop();
+      setStatus(`<span class="tag orange">二进制已替换</span> ${esc(s.message || '请手动重启服务进程后生效')}`);
+      toast('需手动重启服务进程后新版本才生效');
     } else if (s.status === 'idle') {
-      clearInterval(t);
+      stop();
       setStatus(esc(s.message || '已是最新'));
     } else if (s.status === 'downloading' && s.total > 0) {
       // 下载中：进度条 + 取消按钮
@@ -2251,12 +2365,14 @@ function pollUpdate(label) {
   }, 1000);
 }
 function waitHealthy(expected) {
+  clearUpdateTimers();
   let n = 0;
-  const t = setInterval(async () => {
+  healthyTimer = setInterval(async () => {
     n++;
     try {
       const v = await api(BASE + '/api/version');
-      clearInterval(t);
+      if (!v || !v.version) return; // 会话过期/瞬时错误：继续等，不能拿 null 比版本
+      clearInterval(healthyTimer); healthyTimer = 0;
       const ok = !expected || v.version === expected;
       setStatus(ok
         ? `<span class="tag green">更新成功</span> 已更新到 ${esc(v.version)}，页面即将刷新`
@@ -2265,7 +2381,7 @@ function waitHealthy(expected) {
       setTimeout(() => location.reload(), 1500);
     } catch (e) {
       if (n > 60) { // 2 分钟仍不通
-        clearInterval(t);
+        clearInterval(healthyTimer); healthyTimer = 0;
         setStatus('等待服务恢复超时，请检查服务状态');
       }
       if (n % 5 === 0) setStatus(`服务重启中…（${Math.round(n * 2)}s）`);
@@ -2297,8 +2413,9 @@ async function enterTidyView() {
       }
       sel.value = String(d.graceHours);
     }
-    const g1 = $('#tidy-grace'), g2 = $('#tidy-grace2'), p = $('#tidy-pending');
-    if (g1) g1.textContent = d.graceHours;
+    // #tidy-grace 这个 id 在 index.html 里不存在（只有 tidy-grace2），空引用
+    // 已被 if 挡住，留着只会让人以为页面上还有第二个显示位
+    const g2 = $('#tidy-grace2'), p = $('#tidy-pending');
     if (g2) g2.textContent = d.graceHours;
     if (p) p.textContent = d.pending + ' 条';
     if (st) st.textContent = d.pending > 0
@@ -2571,6 +2688,7 @@ on('#trash-clear', 'click', async () => {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: '{}'
     });
+    if (!r) return; // 会话过期时 api() 返回 null，直接取 r.removed 会抛 TypeError
     toast(`已清空 ${r.removed} 项`); loadTrash();
   } catch (e) { toast(e.message); }
 });

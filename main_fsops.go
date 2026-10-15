@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -180,15 +181,16 @@ func moveToTrash(root, target string) (string, error) {
 	var rnd [2]byte
 	_, _ = rand.Read(rnd[:])
 	entry := fmt.Sprintf("%s_%x_%s", stamp, rnd[:], name)
-	for i := 1; ; i++ {
-		if _, err := os.Lstat(filepath.Join(tdir, entry)); os.IsNotExist(err) {
-			break
+	final, err := renameExclusive(tdir, func(i int) string {
+		if i == 0 {
+			return entry
 		}
-		entry = fmt.Sprintf("%s_%x_%d_%s", stamp, rnd[:], i, name)
-	}
-	if err := os.Rename(target, filepath.Join(tdir, entry)); err != nil {
+		return fmt.Sprintf("%s_%x_%d_%s", stamp, rnd[:], i, name)
+	}, target)
+	if err != nil {
 		return "", err
 	}
+	entry = filepath.Base(final)
 	// 旁挂元数据：记录原始相对路径，供「恢复」用；失败不阻断删除但必须留痕
 	rel := filepath.ToSlash(strings.TrimPrefix(strings.TrimPrefix(target, root), string(filepath.Separator)))
 	meta, _ := json.Marshal(map[string]any{"orig": rel, "at": time.Now().UnixMilli()})
@@ -336,21 +338,21 @@ func trashRestore(root, entry string) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", fmt.Errorf("创建原目录失败: %w", err)
 	}
-	// 目标被占用 → 同名自动加后缀，与上传一致
-	if _, err := os.Lstat(dst); err == nil {
-		ext := filepath.Ext(dst)
-		stem := strings.TrimSuffix(dst, ext)
-		for i := 1; ; i++ {
-			cand := fmt.Sprintf("%s(%d)%s", stem, i, ext)
-			if _, err := os.Lstat(cand); os.IsNotExist(err) {
-				dst = cand
-				break
-			}
+	// 目标被占用 → 同名自动加后缀，与上传一致。用独占改名而不是 Lstat+Rename：
+	// 恢复与并发上传同名文件时，Linux 上后到的 Rename 会静默顶掉先落地的文件
+	base := filepath.Base(dst)
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	newDst, err := renameExclusive(filepath.Dir(dst), func(i int) string {
+		if i == 0 {
+			return base
 		}
-	}
-	if err := os.Rename(src, dst); err != nil {
+		return fmt.Sprintf("%s(%d)%s", stem, i, ext)
+	}, src)
+	if err != nil {
 		return "", err
 	}
+	dst = newDst
 	_ = os.Remove(src + ".meta.json")
 	return filepath.ToSlash(strings.TrimPrefix(strings.TrimPrefix(dst, root), string(filepath.Separator))), nil
 }
@@ -408,6 +410,39 @@ func reservedName(name string) bool {
 	return name == trashDirName
 }
 
+// Windows 保留设备名：即便带扩展名（CON.txt）也不能正常创建/删除
+var winReservedDevs = []string{"CON", "PRN", "AUX", "NUL",
+	"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+	"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
+
+func isWinDeviceName(name string) bool {
+	stem := name
+	if i := strings.IndexByte(stem, '.'); i >= 0 {
+		stem = stem[:i]
+	}
+	upper := strings.ToUpper(stem)
+	for _, dev := range winReservedDevs {
+		if upper == dev {
+			return true
+		}
+	}
+	return false
+}
+
+// badLeafName 目标末段名是否不可安全落盘：Windows 保留设备名、结尾的点或空格
+// （Windows 会静默剥掉，落盘结果与请求不一致）、以及回收站保留名。
+// 上传与新建目录走 sanitizeName 就地改写；移动/重命名不能改写 ——
+// 静默换个名字会让用户找不到刚移过去的文件，只能明确拒绝
+func badLeafName(name string) bool {
+	if name == "" || reservedName(name) || isWinDeviceName(name) {
+		return true
+	}
+	if n := len(name); n > 0 && (name[n-1] == '.' || name[n-1] == ' ') {
+		return true
+	}
+	return false
+}
+
 func sanitizeName(name string) string {
 	name = filepath.Base(filepath.FromSlash(name))
 	name = strings.Map(func(r rune) rune {
@@ -419,19 +454,9 @@ func sanitizeName(name string) string {
 	}, name)
 	name = strings.TrimSpace(name)
 	// Windows 保留设备名（含带扩展名形式如 CON.txt）无法正常创建/删除：
-	// 仅检查主名部分，命中时加前缀避让（保留原扩展名）
-	stem := name
-	if i := strings.IndexByte(stem, '.'); i >= 0 {
-		stem = stem[:i]
-	}
-	upper := strings.ToUpper(stem)
-	for _, reserved := range []string{"CON", "PRN", "AUX", "NUL",
-		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"} {
-		if upper == reserved {
-			name = "_" + name
-			break
-		}
+	// 命中时加前缀避让（保留原扩展名）
+	if isWinDeviceName(name) {
+		name = "_" + name
 	}
 	if name == "" || name == "." || name == ".." {
 		name = "unnamed_" + strconv.FormatInt(time.Now().UnixMilli(), 10)
@@ -467,8 +492,12 @@ func handleList(w http.ResponseWriter, r *http.Request, root string) {
 	}
 	entries := []map[string]any{}
 	for _, it := range items {
-		// 根目录下的回收站不进入常规列表（回收站有专页）
-		if it.Name() == trashDirName && rel == "" {
+		// 根目录下的回收站不进入常规列表（回收站有专页）。
+		// 判定要用解析后的目录与 root 比较，而不是原始 query 参数是否为空：
+		// getRoot 会把 root 做 Abs 清理，而 safeJoin(root, "/")、"."、"//" 同样
+		// 落在根目录上，用 rel=="" 判断会让这些写法把 .trash 显示出来
+		// （仅泄露目录名，内容仍被 inTrashRel 挡住，但列表与 total/分页会被带偏）
+		if it.Name() == trashDirName && absEqual(dir, root) {
 			continue
 		}
 		// 分片上传的临时文件对列表不可见（完成前是半成品）
@@ -985,6 +1014,14 @@ func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("文件超过 %dMB 限制", flagMaxMB))
 		return
 	}
+	// 累计字节还要受本次会话声明的 sess.Size 约束。此前只限「单片 64MB」，
+	// 而 MAX_UPLOAD_MB 默认为 0（不限），于是 init 声明 size=1 之后可以不断
+	// 追加片段：complete 永远因长度不符失败，.fup-*.part 却一直涨到 24h GC 为止，
+	// 结果是磁盘被写满而客户端没有任何终态错误
+	if sess.Size > 0 && sess.Received+n > sess.Size {
+		fail(http.StatusRequestEntityTooLarge, "累计字节超过声明的文件大小")
+		return
+	}
 	sess.Received += n
 	sess.LastActive = time.Now()
 	writeJSON(w, 200, map[string]any{"ok": true, "received": sess.Received})
@@ -1033,13 +1070,18 @@ func handleUploadComplete(w http.ResponseWriter, r *http.Request, root string) {
 			map[string]any{"error": fmt.Sprintf("文件超过 %dMB 限制", flagMaxMB)})
 		return
 	}
-	// 最终名占用（含并发完成）时与普通上传一致加 (1)(2) 后缀
-	final, err := exclusiveName(sess.Dir, sess.Name)
+	// 最终名占用（含并发完成）时与普通上传一致加 (1)(2) 后缀。
+	// 必须走独占改名：先前是 exclusiveName 里 Lstat 判空后 os.Rename，
+	// 两个同名分片同时完成会在窗口里选中同一个名字，后到者静默顶掉先到的文件
+	ext := filepath.Ext(sess.Name)
+	stem := strings.TrimSuffix(sess.Name, ext)
+	final, err := renameExclusive(sess.Dir, func(i int) string {
+		if i == 0 {
+			return sess.Name
+		}
+		return fmt.Sprintf("%s(%d)%s", stem, i, ext)
+	}, part)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"error": fsErr("分配最终文件名", err)})
-		return
-	}
-	if err := os.Rename(part, final); err != nil {
 		writeJSON(w, 500, map[string]any{"error": fsErr("分片改名", err)})
 		return
 	}
@@ -1051,22 +1093,35 @@ func handleUploadComplete(w http.ResponseWriter, r *http.Request, root string) {
 	}})
 }
 
-// exclusiveName 在 dir 内为 name 找一个不冲突的名字（name、name(1).ext、name(2).ext…）
-func exclusiveName(dir, name string) (string, error) {
-	ext := filepath.Ext(name)
-	stem := strings.TrimSuffix(name, ext)
-	for i := 0; ; i++ {
-		cand := name
-		if i > 0 {
-			cand = fmt.Sprintf("%s(%d)%s", stem, i, ext)
-		}
-		p := filepath.Join(dir, cand)
-		if _, err := os.Lstat(p); os.IsNotExist(err) {
-			return p, nil
-		} else if err != nil {
+// renameExclusive 把 src 改名进 dir 内第一个未被占用的候选名（由 cand(i) 生成，
+// i=0 通常是原名、i>0 是加后缀的备选）。
+//
+// 只「Lstat 判空 + os.Rename」是不够的：Linux 上 os.Rename 会静默替换已存在的目标，
+// 两个并发请求（同名分片上传同时完成、恢复撞上刚上传的同名文件、并发删除进回收站）
+// 会在 Lstat 与 Rename 之间的窗口里选中同一个名字，后到者把先落地的文件顶掉，
+// 而两边都收到 2xx —— 表现为「操作成功但文件少了一个」。
+// 这里先用 O_CREAT|O_EXCL 独占创建一个占位标记把名字钉住，再让 Rename 覆盖它自己：
+// 独占创建保证同一时刻只有一个请求拿到这个名字，其余自动顺延到下一个候选
+func renameExclusive(dir string, cand func(i int) string, src string) (string, error) {
+	for i := 0; i < 10000; i++ {
+		final := filepath.Join(dir, cand(i))
+		f, err := os.OpenFile(final, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			// Windows 上「目标已存在且是目录」给出的是 ACCESS_DENIED 而不是 EEXIST，
+			// 因此以「路径是否存在」为准判定占用，其余错误如实上报
+			if _, e2 := os.Lstat(final); e2 == nil {
+				continue
+			}
 			return "", err
 		}
+		_ = f.Close()
+		if err := os.Rename(src, final); err != nil {
+			_ = os.Remove(final) // 只删得掉自己刚创建的占位文件
+			return "", err
+		}
+		return final, nil
 	}
+	return "", errors.New("同名的候选项过多")
 }
 
 // handleUploadStatus GET /api/upload/status?id= → {received,size}（页面刷新后续传）
@@ -1119,6 +1174,44 @@ func gcUploadSessions() {
 		s.mu.Lock()
 		_ = os.Remove(filepath.Join(s.Dir, uploadTempPrefix+s.ID+uploadTempSuffix))
 		s.mu.Unlock()
+	}
+}
+
+// sweepUploadTemps 启动时清扫一次遗留的分片临时文件。
+// 上传会话只存在内存里，进程重启后 upSessMap 为空：那些再没人续传的半成品
+// 既不会被 handleUploadInit 的「同目录孤儿清理」命中（要等同一目录再次 init），
+// 也不会被 GC 摸到，于是永久占着磁盘，同时在列表/搜索/打包里全都看不见。
+// 只在启动跑一次，不进定时任务——大库的全盘遍历不该每小时来一遍
+func sweepUploadTemps(root string) {
+	cutoff := time.Now().Add(-uploadTempTTL)
+	var removed int
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			// 回收站里是已删除内容，不动（等回收站自身的保留策略处理）
+			if d.Name() == trashDirName {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		name := d.Name()
+		if !strings.HasPrefix(name, uploadTempPrefix) || !strings.HasSuffix(name, uploadTempSuffix) {
+			return nil
+		}
+		if info, e := d.Info(); e == nil && info.ModTime().Before(cutoff) {
+			if os.Remove(p) == nil {
+				removed++
+			}
+		}
+		return nil
+	})
+	if removed > 0 {
+		log.Printf("[上传] 启动清扫：删除 %d 个超过 %v 无人续传的分片临时文件", removed, uploadTempTTL)
 	}
 }
 
@@ -1243,7 +1336,7 @@ func zipAdd(zw *zip.Writer, root, abs, name string) error {
 // serveZipStream 把多个 abs 路径打包成 zip 流式写出（zipName 不含 .zip 后缀）
 // 所有路径必须已通过 safeJoin/realPathInside 校验
 func serveZipStream(w http.ResponseWriter, r *http.Request, root string, paths []string, zipName string) {
-	// 先统一校验存在性：流开始后出错无法再改状态码
+	// 先统一校验存在性：流开始后无法再改状态码
 	for _, p := range paths {
 		if _, err := os.Lstat(p); err != nil {
 			writeJSON(w, 404, map[string]any{"error": "文件不存在: " + filepath.Base(p)})
@@ -1256,9 +1349,23 @@ func serveZipStream(w http.ResponseWriter, r *http.Request, root string, paths [
 	w.WriteHeader(200)
 	zw := zip.NewWriter(w)
 	defer zw.Close()
+	var skipped []string
 	for _, p := range paths {
+		if r.Context().Err() != nil {
+			return // 客户端已断开，继续遍历只是白烧 IO
+		}
 		if err := zipAdd(zw, root, p, filepath.Base(p)); err != nil {
-			return // 流已开始，只能中断
+			// 记下并继续，最后补一个说明条目。此前是「出错就 return」：
+			// defer zw.Close() 照样写出完整的中央目录，浏览器拿到的是一个
+			// 结构正常的 zip，少掉的文件夹无声消失，前端还报「已开始下载」
+			log.Printf("[打包] 跳过 %s: %v", p, err)
+			skipped = append(skipped, filepath.Base(p))
+		}
+	}
+	if len(skipped) > 0 {
+		if f, err := zw.Create("_打包失败.txt"); err == nil {
+			fmt.Fprintf(f, "以下 %d 项未能打包（被删除、改名、占用或读取失败）：\n%s\n",
+				len(skipped), strings.Join(skipped, "\n"))
 		}
 	}
 }
@@ -1409,6 +1516,13 @@ func handleMove(w http.ResponseWriter, r *http.Request, root string) {
 		writeJSON(w, 400, map[string]any{"error": "非法目标路径"})
 		return
 	}
+	// 目标末段名要与上传/新建目录同一套校验：此前 handleMove 完全不查，
+	// to="CON" 或 "x." 会一路走到 os.Rename，报成 500（fsErr 脱敏后用户
+	// 只看到「服务器文件操作失败」，无从知道是名字不合法），错误类别也不对
+	if badLeafName(filepath.Base(toAbs)) {
+		writeJSON(w, 400, map[string]any{"error": "目标名称不合法（系统保留名或不以点/空格结尾）"})
+		return
+	}
 	if fromAbs == root || toAbs == root {
 		writeJSON(w, 400, map[string]any{"error": "非法目标路径"})
 		return
@@ -1471,8 +1585,12 @@ func moveShareSync(root, fromAbs, toAbs string) bool {
 			s.Name = filepath.Base(toAbs)
 			changed = true
 		} else if absPrefix(fromAbs, s.AbsPath) {
-			// 目录内子文件的分享：前缀整体替换，RelPath 基于新 AbsPath 重算
-			s.AbsPath = toAbs + strings.TrimPrefix(s.AbsPath, fromAbs)
+			// 目录内子文件的分享：前缀整体替换，RelPath 基于新 AbsPath 重算。
+			// 必须按长度切而不是 strings.TrimPrefix：absPrefix 在 Windows/macOS
+			// 上大小写不敏感，TrimPrefix 却敏感 —— 请求里的 from 与库里记录的
+			// 大小写不一致时 TrimPrefix 是空操作，路径会拼成
+			// toAbs + 整个旧绝对路径，该目录下所有子分享从此 404
+			s.AbsPath = toAbs + s.AbsPath[len(fromAbs):]
 			s.RelPath = filepath.ToSlash(strings.TrimPrefix(strings.TrimPrefix(s.AbsPath, root), string(filepath.Separator)))
 			changed = true
 		}

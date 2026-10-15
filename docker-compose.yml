@@ -1,11 +1,15 @@
 services:
   fileserver:
     build: .
-    # 也可以直接用现成镜像：image: ghcr.io/xxx/fileserver:latest
+    # 仓库当前不发布容器镜像；要现成的就自行 build：
+    #   docker build -t fileserver:local .  然后把上面一行换掉
     container_name: fileserver
     restart: unless-stopped
     ports:
-      # 仅监听本机，由 Nginx/Caddy 反代后对外；不用反代就改成 "8080:8080"
+      # 默认只监听本机，由 Nginx/Caddy 反代后对外。
+      # 若改成 "8080:8080" 直接对外：端口前面没有反代，就别开 TRUST_PROXY ——
+      # docker 用 userland proxy 发布端口时直连来源是网桥网关（内网地址），
+      # 旧版本会把它当可信代理，于是 X-Real-IP 完全由客户端决定
       - "127.0.0.1:16666:8080"
     environment:
       PORT: 8080
@@ -13,15 +17,24 @@ services:
       ROOT_DIR: /files
       # 配置与分享记录存放位置（必须持久化，否则分享链接重启即失效）
       DATA_DIR: /app/data
-      # 走反向代理时必须为 1，分享链接才会用真实域名/协议
-      TRUST_PROXY: "1"
-      # 以下带 ${VAR:-default} 的项会读取同目录 .env 文件（参见 .env.example），
-      # 未提供时使用这里写的默认值。请勿把真实密码提交进仓库。
-      AUTH_USER: ${AUTH_USER:-admin}
-      AUTH_PASS: ${AUTH_PASS:-change-me-please}
+      # 反代头识别：默认关。架了同机 Nginx/Caddy 再打开（环回来源本就可信）
+      TRUST_PROXY: ${TRUST_PROXY:-0}
+      # 显式声明可信代理网段（环回之外只有列在这里的才采信转发头）
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      # TLS 在代理上终结但未开 TRUST_PROXY 时，用它强制 Cookie 的 Secure 与 HSTS
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
+      # 以下带 ${VAR} 的项会读取同目录 .env 文件（参见 .env.example）。
+      # AUTH_PASS 不给默认值：缺了就直接启动失败，而不是带着一份公开仓库里
+      # 写过的口令上线（v1.6.0 起这一个口令就是整个管理端与自更新的钥匙）
+      AUTH_USER: ${AUTH_USER:?请在 .env 里设置 AUTH_USER}
+      AUTH_PASS: ${AUTH_PASS:?请在 .env 里设置 AUTH_PASS，不要用示例值}
+      UAPI_KEY: ${UAPI_KEY:-}
       # 单文件上传上限（MB），0 表示不限制
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-0}
       LOG: ${LOG:-1}
     volumes:
       - ./files:/files
       - ./data:/app/data
+    # 镜像内以 uid/gid 1000 运行。若宿主机上的 ./files、./data 不属这个 uid 导致
+    # 「目录不可写」，按宿主机用户覆盖，例如：
+    # user: "1000:1000"

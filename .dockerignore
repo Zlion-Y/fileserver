@@ -1,4 +1,6 @@
-# 构建镜像只需要 go.mod / *.go / public/，其余一律不进构建上下文
+# 构建镜像只需要 go.mod / *.go / public/，其余一律不进构建上下文。
+# .env 与本地二进制必须排除：前者可能写着真实口令，后者有 11MB 且每次构建
+# 都会把整份塞进上传给 daemon 的上下文里
 .git
 .github
 .workbuddy
@@ -10,3 +12,12 @@ deploy
 *.md
 install-remote.sh
 build.sh
+.env
+.env.*
+!.env.example
+*.exe
+*.tmp
+*.tmp-*
+*.part
+*.log
+目录

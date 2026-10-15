@@ -4,30 +4,44 @@ After=network.target
 
 [Service]
 Type=simple
-# 建议使用非 root 专用用户（安装脚本可用 FS_USER 指定，例如 useradd -r -s /usr/sbin/nologin fileserver）
-# User=fileserver
-# Group=fileserver
-# 手动套用本模板时 /opt/fileserver 可能不存在，systemd 会因 CHDIR 失败而启动不了，故先创建
-ExecStartPre=/bin/mkdir -p /opt/fileserver /opt/fileserver/data
+# 用专用非特权账号运行（install-remote.sh 会自动创建这个账号；手工套用时先执行）：
+#   useradd --system --home-dir /opt/fileserver/data --shell /usr/sbin/nologin fileserver
+#   mkdir -p /data/files /opt/fileserver/data && chown -R fileserver:fileserver /data/files /opt/fileserver/data
+# 注意：本服务在页面里「一键更新」时要替换自己的二进制（默认 /usr/local/bin/fileserver），
+#       该目录必须对这个账号可写，否则更新会报「替换失败」
+User=fileserver
+Group=fileserver
 WorkingDirectory=/opt/fileserver
 Environment=PORT=16666
 Environment=HOST=0.0.0.0
 Environment=ROOT_DIR=/data/files
 Environment=DATA_DIR=/opt/fileserver/data
+# 采信 X-Forwarded-*/X-Real-IP：只在本机跑 Nginx/Caddy 反代时才设 1
+# （环回来源默认可信）。端口直接对外时务必设 0，否则客户端能自己声明来源 IP，
+# 按 IP 记账的登录封禁与访问日志都会失真。反代不在同一台机器时，
+# 还要把它的网段写进 TRUSTED_PROXIES
 Environment=TRUST_PROXY=1
+# Environment=TRUSTED_PROXIES=172.17.0.1/32
+# TLS 在反代上终结、但又不想开 TRUST_PROXY 时，用它强制 Cookie 的 Secure 与 HSTS
+# Environment=COOKIE_SECURE=1
 Environment=AUTH_USER=admin
-Environment=AUTH_PASS=change-me-please
+# 不要把可用口令写进模板：公开仓库里的默认口令就是别人登录你的管理端的钥匙。
+# 取消下面这行并改成自己的口令 —— 用户名与口令必须成对，只设用户名时
+# 服务会拒绝启动（空密码等于没设认证）
+# Environment=AUTH_PASS=
 Environment=MAX_UPLOAD_MB=0
 Environment=LOG=1
-ExecStart=/usr/local/bin/fileserver --port 16666 --dir /data/files --data-dir /opt/fileserver/data --trust-proxy
+# 不要在这里重复写 --port/--dir/--data-dir/--trust-proxy：显式 flag 永远压过
+# Environment，用户改上面的 PORT/ROOT_DIR 会变成静默无效
+ExecStart=/usr/local/bin/fileserver
 Restart=always
 RestartSec=3
 StandardOutput=journal
 StandardError=journal
 
 # ---- 安全加固 ----
-# 注意：未启用 ProtectSystem=strict，因为 ExecStartPre 需要在 /opt 下建目录；
-#       若去掉 ExecStartPre 并预先创建好目录，可改回 strict 并配 ReadWritePaths 收紧。
+# ProtectSystem 用 full 而不是 strict：/usr 只读会让「一键更新」替换自身失败，
+# 所以这里保留 /usr/local/bin 可写，其余按最小权限收紧
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true

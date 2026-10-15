@@ -62,63 +62,77 @@ Go 实现（零第三方库），前端经 `//go:embed` 编译进二进制，拷
 
 ### 方式一：GitHub Release（推荐）
 
-仓库内置 workflow：每次 push 跑 `go vet` + 编译 + 冒烟测试；打 tag 自动交叉编译 8 个平台并发布 Release。
+仓库内置 workflow：每次 push 跑 `go vet` + 编译 + 冒烟测试；打 tag 自动交叉编译 9 个平台并发布 Release。
 
 ```bash
-git tag v1.0.3 && git push origin v1.0.3
+git tag v1.7.1 && git push origin v1.7.1
 ```
 
 产物：`linux_amd64 / linux_arm64 / linux_armv7 / linux_armv5 / linux_386 /
-linux_mipsle / windows_amd64.exe / darwin_arm64`。
+linux_mipsle / windows_amd64.exe / darwin_amd64 / darwin_arm64`，另附 `SHA256SUMS`。
+
+> 9 个平台缺任何一个都不会发布半成品 Release（workflow 里有产物齐全性门禁）。
 
 ### 方式二：本机编译
 
 ```bash
-bash build.sh                              # 编译全部平台 -> dist-go/
+bash build.sh                              # 编译全部平台 -> dist-go/（含 SHA256SUMS）
 bash build.sh linux/amd64 linux/arm/5      # 只编译指定平台
-VERSION=v1.0.3 bash build.sh
+VERSION=v1.7.0 bash build.sh               # 不写则自动取最近的 git tag
+```
 ```
 
 ## 部署到 Linux 服务器（一键脚本，推荐）
 
-脚本自动识别 CPU 架构（amd64 / arm64 / armv7 / armv5 / mipsle / 386）、从 Release 下载二进制、放行防火墙、注册 systemd 开机自启。
+脚本自动识别 CPU 架构（amd64 / arm64 / armv7 / armv5 / mipsle / 386）、从 Release 下载二进制并校验 SHA256、放行防火墙、创建专用非 root 服务账号、注册 systemd 开机自启。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Zlion-Y/fileserver/main/install-remote.sh -o install-remote.sh
-sudo bash install-remote.sh --dry-run                        # 先看会做什么，不改系统
-sudo FS_USER=admin FS_PASS=你的密码 bash install-remote.sh   # 正式安装
+sudo bash install-remote.sh --dry-run      # 先看会做什么，不改系统
+sudo FS_USER=admin bash install-remote.sh  # 正式安装：口令会交互询问（不回显）
 ```
+
+> **口令别放命令行**：`sudo FS_PASS=xxx bash install-remote.sh` 里的 `FS_PASS=xxx` 是
+> `sudo` 的 argv，任何本地用户 `ps` 一下就能看到。要非交互就指一个 0600 的文件：
+> `sudo FS_USER=admin FS_PASS_FILE=/run/secrets/fs_pass bash install-remote.sh`，
+> 或先 `export FS_PASS=...` 再用 `sudo -E` 继承环境。
 
 | 需求 | 命令 |
 | --- | --- |
 | 换文件目录 / 端口 | `sudo DIR=/mnt/disk/share PORT=9000 bash install-remote.sh` |
-| 指定版本 | `sudo VERSION=v1.0.3 bash install-remote.sh` |
-| 升级到最新版 | 重跑安装即可（自动继承已有配置与密码） |
-| 卸载（保留文件与分享记录） | `sudo bash install-remote.sh --uninstall` |
+| Nginx/Caddy 与服务同机 | `sudo FS_PROXY=1 bash install-remote.sh`（反代不在本机时还要给 `FS_TRUSTED_CIDRS`） |
+| 指定版本 | `sudo VERSION=v1.7.0 bash install-remote.sh` |
+| 升级到最新版 | 重跑安装即可（自动继承已有配置与口令；旧二进制会留 `.bak` 备份，起不来自动回滚） |
+| 卸载 | `sudo bash install-remote.sh --uninstall`（保留文件与分享记录，但会删掉写着口令的 `/etc/fileserver.env`） |
 
 装好后：配置在 `/etc/fileserver.env`（改完 `systemctl restart fileserver`），日志 `journalctl -u fileserver -f`。
 
-### 手动部署（三行）
+### 手动部署
 
 ```bash
 sudo curl -fsSL -o /usr/local/bin/fileserver \
-  https://github.com/Zlion-Y/fileserver/releases/download/v1.0.3/fileserver_linux_amd64
+  https://github.com/Zlion-Y/fileserver/releases/latest/download/fileserver_linux_amd64
 sudo chmod +x /usr/local/bin/fileserver
-sudo /usr/local/bin/fileserver --port 16666 --dir /data/files \
-     --data-dir /var/lib/fileserver --user admin --pass 你的密码
+sudo AUTH_USER=admin AUTH_PASS=你的密码 /usr/local/bin/fileserver \
+     --port 16666 --dir /data/files --data-dir /var/lib/fileserver
 ```
 
 `--data-dir` 必须落在持久目录，分享记录存在里面的 `shares.json`。
+口令走 `AUTH_PASS` 环境变量而不是 `--pass`，理由同上面那条警告。
 
 ## Docker
 
 ```bash
-cp .env.example .env      # 修改 ROOT_DIR / AUTH_PASS 等
+cp .env.example .env      # 必须填 AUTH_USER / AUTH_PASS，没有默认口令
 docker compose up -d      # 多阶段构建，数据落在 ./files 与 ./data
 ```
 
 `docker-compose.yml` 默认只监听 `127.0.0.1:16666`，由 Nginx/Caddy 反代后对外。
-`.env` 里的 `AUTH_PASS` 会经 `${AUTH_PASS:-...}` 插值注入容器，**务必改成强密码**（默认值仅作占位）。
+`AUTH_PASS` 未设置时 compose 会直接报错退出 —— 仓库里写过的示例口令等于给别人
+留了一把开管理端的钥匙（v1.6.0 起这一个口令就是整个后台与「一键更新」的凭据）。
+容器内以 uid 1000 运行；若宿主机上的 `./files`、`./data` 不属这个 uid 导致写不进去，
+在 compose 里加一行 `user: "1000:1000"`（或你自己的 uid）覆盖。
+本仓库不发布容器镜像，请自行 `docker build -t fileserver:local .`。
 
 ## 手动 systemd + Nginx
 
@@ -138,9 +152,12 @@ sudo nginx -t && sudo systemctl reload nginx
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `ROOT_DIR` | 无 | 预设文件根目录，设置后无需网页首次配置 |
 | `DATA_DIR` | `./data` | 存放 `config.json` / `shares.json` / `sessions.json`，**必须持久化** |
-| `TRUST_PROXY` | `0` | 置 `1` 后按 `X-Forwarded-Proto/Host` 生成分享链接（反代必开） |
-| `AUTH_USER` / `AUTH_PASS` | 无 | 管理端认证；设置后浏览器走登录页 + Cookie 会话，Basic 认证供 curl / 脚本兼容 |
-| `SESSION_DAYS` | `7` | 登录会话有效期（天） |
+| `TRUST_PROXY` | `0` | 置 `1` 后按 `X-Forwarded-Proto/Host` 生成分享链接、按 `X-Real-IP`/`XFF` 末段记来源 IP |
+| `TRUSTED_PROXIES` | 空 | 配合上一项：除**环回**外，还有哪些网段算自己的代理（CIDR 逗号分隔，如 `172.17.0.1/32`）。内网地址段本身不代表可信 —— 端口直接被发布时，来源 IP 常常就是 docker 网桥，此时采信转发头等于让客户端自己声明 IP，可按 IP 绕过登录封禁 |
+| `COOKIE_SECURE` | `0` | TLS 在反代终结、又没开 `TRUST_PROXY` 时置 `1`，强制会话 Cookie 带 `Secure` 并下发 HSTS |
+| `AUTH_USER` / `AUTH_PASS` | 无 | 管理端认证；设置后浏览器走登录页 + Cookie 会话，Basic 认证供 curl / 脚本兼容。两者必须成对，用户名而没口令（或 `config.json` 里存过哈希却丢了用户名）时服务**拒绝启动** |
+| `FS_MASTER_KEY` | 无 | 分享密码的 AES-GCM 主密钥；不设置则在 `DATA_DIR/.masterkey` 生成并保留（换密钥会让已存的分享密码解不开） |
+| `SESSION_DAYS` | `7` | 登录会话有效期（天），限 `1~365`；越界值会被钳制并告警（`0` 会让会话刚签发就过期） |
 | `TIDY_HOURS` | `72` | 分享记录过期后保留时长（小时），仅在 config.json 尚未保存过清理配置时作为初始值 |
 | `TRASH_DAYS` | `7` | 回收站保留天数，超过自动彻底删除；`0` = 永久保留 |
 | `SEARCH_LIMIT` | `200` | 全盘搜索最多返回条数（上限 1000） |

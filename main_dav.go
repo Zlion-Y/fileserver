@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"mime"
 	"net/http"
@@ -99,38 +100,114 @@ func davPropfind(w http.ResponseWriter, r *http.Request, root, rel string) {
 	}
 	depth := strings.ToLower(strings.TrimSpace(r.Header.Get("Depth")))
 	if depth == "" {
-		depth = "infinity"
+		depth = "infinity" // RFC 4918 §9.1：缺省即 infinity
+	}
+	switch depth {
+	case "0", "1", "infinity":
+	default:
+		// 0/1 是 class 1 必须支持的档位，infinity 本服务器也支持，其余一律按非法请求
+		w.Header().Set("Content-Type", `application/xml; charset="utf-8"`)
+		w.WriteHeader(400)
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>` +
+			`<D:error xmlns:D="DAV:"><D:invalid-depth/></D:error>`))
+		return
 	}
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 	b.WriteString(`<D:multistatus xmlns:D="DAV:">`)
 	davWriteResponse(&b, rel, st)
+	n := 1
 	if depth != "0" && st.IsDir() {
-		items, err := os.ReadDir(p)
-		if err == nil {
-			for _, it := range items {
-				if rel == "" && it.Name() == trashDirName {
-					continue
+		// 旧实现把 infinity 与任何非 0 值都静默当 1 层返回。备份/同步类客户端
+		// 不查 Depth 或明确要 infinity 时，会把「没列出来的」当成「服务端没有的」，
+		// 配上 delete-sync 就是一次静默删远端 —— 宁可如实报错，也不能给半棵树
+		truncated := false
+		if depth == "1" {
+			items, err := os.ReadDir(p)
+			if err == nil {
+				for _, it := range items {
+					if davSkipEntry(rel, it) {
+						continue
+					}
+					info, err := it.Info()
+					if err != nil {
+						continue
+					}
+					davWriteResponse(&b, davJoinRel(rel, it.Name()), info)
+					n++
 				}
-				if isUploadTemp(it.Name()) {
-					continue
-				}
-				info, err := it.Info()
-				if err != nil {
-					continue
-				}
-				child := it.Name()
-				if rel != "" {
-					child = rel + "/" + it.Name()
-				}
-				davWriteResponse(&b, child, info)
 			}
+		} else {
+			_ = filepath.WalkDir(p, func(cp string, d fs.DirEntry, e error) error {
+				if e != nil || cp == p {
+					return nil
+				}
+				if d.IsDir() && davSkipEntry(rel, d) {
+					return fs.SkipDir
+				}
+				if davSkipEntry(rel, d) {
+					return nil
+				}
+				info, err := d.Info()
+				if err != nil {
+					return nil
+				}
+				child := filepath.ToSlash(strings.TrimPrefix(strings.TrimPrefix(cp, p), string(filepath.Separator)))
+				davWriteResponse(&b, child, info)
+				if n++; n > davPropfindMax {
+					truncated = true
+					return fs.SkipAll
+				}
+				return nil
+			})
+		}
+		if truncated {
+			log.Printf("[WebDAV] PROPFIND Depth: infinity 在 %s 下超过 %d 条，按 depth-not-supported 拒绝", p, davPropfindMax)
+			w.Header().Set("Content-Type", `application/xml; charset="utf-8"`)
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>` +
+				`<D:error xmlns:D="DAV:"><D:depth-not-supported/></D:error>`))
+			return
 		}
 	}
 	b.WriteString(`</D:multistatus>`)
 	w.Header().Set("Content-Type", `application/xml; charset="utf-8"`)
 	w.WriteHeader(207)
 	_, _ = w.Write([]byte(b.String()))
+}
+
+// davPropfindMax infinity 递归的条目上限：超限不如如实报错，
+// 半棵树当全树返回会诱发客户端的 delete-sync 误删
+const davPropfindMax = 5000
+
+// davSkipEntry 回收站与分片临时文件不对外可见（与 handleList 同一口径）
+func davSkipEntry(rel string, d fs.DirEntry) bool {
+	if rel == "" && d.Name() == trashDirName {
+		return true
+	}
+	return isUploadTemp(d.Name())
+}
+
+func davJoinRel(rel, name string) string {
+	if rel == "" {
+		return name
+	}
+	return rel + "/" + name
+}
+
+// davText XML 文本节点安全化：转义五个实体，并把 XML 1.0 不允许出现的
+// C0 控制字符（保留 TAB/LF/CR）替换为 U+FFFD。
+// davPut 接受任何 safeJoin 允许的名字，Linux 侧一个名为 "a\x01b.txt" 的文件
+// 就能让整份 207 响应变成畸形 XML —— 于是该目录对所有 DAV 客户端不可列
+func davText(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x20 && r != '\t' && r != '\n' && r != '\r' {
+			r = '\uFFFD'
+		}
+		b.WriteRune(r)
+	}
+	return htmlEsc(b.String())
 }
 
 // davWriteResponse 单个资源的 propstat XML
@@ -146,14 +223,14 @@ func davWriteResponse(b *strings.Builder, rel string, st os.FileInfo) {
 	if name == "" {
 		name = "/"
 	}
-	b.WriteString(`<D:displayname>` + htmlEsc(name) + `</D:displayname>`)
+	b.WriteString(`<D:displayname>` + davText(name) + `</D:displayname>`)
 	if !isDir {
 		b.WriteString(`<D:getcontentlength>` + strconv.FormatInt(st.Size(), 10) + `</D:getcontentlength>`)
 		ct := "application/octet-stream"
 		if t := mime.TypeByExtension(strings.ToLower(filepath.Ext(name))); t != "" {
 			ct = t
 		}
-		b.WriteString(`<D:getcontenttype>` + htmlEsc(ct) + `</D:getcontenttype>`)
+		b.WriteString(`<D:getcontenttype>` + davText(ct) + `</D:getcontenttype>`)
 	}
 	if isDir {
 		b.WriteString(`<D:resourcetype><D:collection/></D:resourcetype>`)
@@ -370,8 +447,22 @@ func davMove(w http.ResponseWriter, r *http.Request, root, rel string) {
 		return
 	}
 	du, err := url.Parse(dest)
-	if err != nil || !strings.HasPrefix(du.Path, davPathPrefix) {
-		w.WriteHeader(400) // 目标必须在 /dav 命名空间内
+	if err != nil || du.Path == "" {
+		w.WriteHeader(400)
+		return
+	}
+	// Destination 可以是绝对 URI（RFC 4918 §10.5 的常见写法），此时必须同主机，
+	// 否则等于允许把资源"移动"到别人服务器上 —— 旧实现完全不看 host，
+	// `Destination: http://evil/dav/x` 会被当成本地路径接受
+	if du.Host != "" && !strings.EqualFold(du.Host, clientHost(r)) {
+		w.WriteHeader(http.StatusBadGateway) // 外部目标：本服务器不代理
+		return
+	}
+	// 必须在 /dav 命名空间内，且以分隔符收尾：只判 HasPrefix("/dav")
+	// 会让 /davex.txt 通过，TrimPrefix 后得到 drel="ex.txt"，
+	// 资源被静默放到 root/ex.txt 而不是客户端要求的位置
+	if du.Path != davPathPrefix && !strings.HasPrefix(du.Path, davPathPrefix+"/") {
+		w.WriteHeader(400)
 		return
 	}
 	drel := strings.TrimPrefix(du.Path, davPathPrefix)
@@ -468,13 +559,15 @@ func davMove(w http.ResponseWriter, r *http.Request, root, rel string) {
 	}
 }
 
-// davProppatch 最小实现：一律应答 200（播放器客户端不校验属性写回结果）
+// davProppatch 本服务器不保存任何自定义属性，因此如实回 403 而不是假 200。
+// 旧实现一律应答 200：客户端（含挂载盘）据此认为属性写入成功，
+// 元数据静默丢失，并发编辑也得不到任何互斥提示
 func davProppatch(w http.ResponseWriter, rel string) {
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 	b.WriteString(`<D:multistatus xmlns:D="DAV:"><D:response>`)
 	b.WriteString(`<D:href>` + davHref(rel, false) + `</D:href>`)
-	b.WriteString(`<D:propstat><D:prop/><D:status>HTTP/1.1 200 OK</D:status></D:propstat>`)
+	b.WriteString(`<D:propstat><D:prop/><D:status>HTTP/1.1 403 Forbidden</D:status></D:propstat>`)
 	b.WriteString(`</D:response></D:multistatus>`)
 	w.Header().Set("Content-Type", `application/xml; charset="utf-8"`)
 	w.WriteHeader(207)

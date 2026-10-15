@@ -79,47 +79,77 @@ func envInt(k string, def int) int {
 	}
 	return def
 }
-func envBool(k string, def bool) bool {
-	if v := os.Getenv(k); v != "" {
-		return v == "1" || strings.EqualFold(v, "true")
+
+// envIntRange 带区间钳制的整数配置。裸 envInt 让越界值直通到底层运算：
+// SESSION_DAYS=0 会让会话「刚签发即过期」，TIDY_HOURS 极大值在
+// time.Duration(h)*time.Hour 上溢出为负、把清理截止推到未来而一次删光有效分享。
+// 这类值没有任何理由是笔误之外的正确配置，钳制 + 告警比照单全收安全
+func envIntRange(k string, def, lo, hi int) int {
+	n := envInt(k, def)
+	if n < lo || n > hi {
+		log.Printf("[配置] %s=%d 超出允许区间 [%d,%d]，已按默认值 %d 处理", k, n, lo, hi, def)
+		return def
 	}
+	return n
+}
+
+// envBool 只认明确写法；无法识别的取值回落默认值并告警。
+// 旧实现把一切非 "1"/"true" 的值当 false，于是 LOG=on、TRUST_PROXY=yes
+// 会在用户以为开启的情况下静默关掉审计日志/转发头识别
+func envBool(k string, def bool) bool {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	switch strings.ToLower(v) {
+	case "1", "t", "true", "y", "yes", "on", "enabled":
+		return true
+	case "0", "f", "false", "n", "no", "off", "disabled":
+		return false
+	}
+	log.Printf("[配置] %s=%q 不是可识别的布尔值，已按默认值 %v 处理", k, v, def)
 	return def
 }
 
 // ---------------- 持久化 ----------------
 func dataPath(name string) string {
-	os.MkdirAll(flagDataDir, 0o755)
+	if err := os.MkdirAll(flagDataDir, 0o700); err != nil {
+		log.Printf("[持久化] 数据目录 %s 创建失败: %v", flagDataDir, err)
+	}
 	return filepath.Join(flagDataDir, name)
 }
 
 // atomicWriteFile 临时文件 + fsync + rename 的原子落盘：
 // 没有 Sync 的话断电后 rename 出来的可能是 0 长度文件；写失败必须暴露给调用方，
 // 静默丢弃会让管理员收到「已保存」的假成功（磁盘满/只读时配置实际回退了）
+//
+// 临时名用 CreateTemp 随机后缀 + O_EXCL，不用固定 path+".tmp"：固定名在多进程
+// 共用数据目录时（自更新重启窗口新旧进程重叠）会互相截断，而本地用户预先放置的
+// 同名文件或指向别处的符号链接，会让 O_TRUNC 穿透写到链接目标上，
+// 且已存在的 tmp 会让 perm 参数被内核忽略、"0600 的秘密文件"实际沿用旧权限
 func atomicWriteFile(path string, b []byte, perm os.FileMode) error {
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(b); err != nil {
-		f.Close()
-		os.Remove(tmp)
+	// 无论后续走到哪个 return，都要把中间文件收掉，否则磁盘上留一堆 .tmp-N
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
 		return err
 	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return nil
+	return os.Rename(tmp.Name(), path)
 }
 
 // backupCorrupt 把损坏的数据文件改名留证（.corrupt-<时间戳>），
@@ -248,6 +278,3 @@ func getRoot() (string, error) {
 	}
 	return abs, nil
 }
-
-// absEqual / absPrefix 大小写不敏感文件系统上的绝对路径等价与前缀判定：
-// Windows 上仅改变大小写的父目录改名会让字符串前缀匹配失配

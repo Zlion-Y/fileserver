@@ -130,11 +130,18 @@ type dlTicketRec struct {
 	Token string
 	Exp   int64
 	// Served 本 ticket 至今已实际下发的字节数。
-	// 用来区分「上一次传输确实没传完」与「已经完整传过一次」：
-	// 没有它的话，一次正常下载拿到 ticket 之后，反复带 Range: bytes=1-
-	// 每次都能取到接近完整的文件而永不计数（实测可复现），maxDownloads 形同虚设。
 	Served int64
+	// Done 标记「已经完整地传过一次到文件末尾」。用它而不是 Served 与文件大小的
+	// 比较：bytes=1- 这类请求只下发 size-1 字节，按字节数判「传完」永远差一截，
+	// 于是同一次计次之后还能反复带 bytes=1- 再取接近完整的文件（实测可复现）。
+	// 只有「覆盖到末尾且实际写出的字节不少于该片段应发的字节」才置位，
+	// 中途断线时字节不够、标记不成立，合法续传照样豁免
+	Done bool
 }
+
+// dlTicketMax 内存上限：每个「计了次」的下载都会签发一条 ticket，
+// 无上限时长挂零下载配额（maxDownloads=0）的链接每来一个访客就堆积一条
+const dlTicketMax = 65536
 
 func newDlTicket(token string) string {
 	buf := make([]byte, 24)
@@ -143,6 +150,20 @@ func newDlTicket(token string) string {
 	}
 	ticket := hex.EncodeToString(buf)
 	dlTicketMu.Lock()
+	if len(dlTickets) >= dlTicketMax {
+		// 先回收过期项；仍超限就不再签发（下载照常，只是没有续传豁免），
+		// 宁可丢掉一个便利特性，也不能让匿名请求把内存顶穿
+		now := time.Now().UnixMilli()
+		for k, rec := range dlTickets {
+			if now >= rec.Exp {
+				delete(dlTickets, k)
+			}
+		}
+		if len(dlTickets) >= dlTicketMax {
+			dlTicketMu.Unlock()
+			return ""
+		}
+	}
 	dlTickets[ticket] = dlTicketRec{Token: token, Exp: time.Now().Add(dlTicketTTL).UnixMilli()}
 	dlTicketMu.Unlock()
 	return ticket
@@ -251,10 +272,76 @@ func dlTicketAddServed(ticket string, n int64) {
 	dlTicketMu.Unlock()
 }
 
-// countingWriter 统计一次响应实际写出的字节数（累加到 ticket 的 Served）
+// dlTicketDone 该 ticket 是否已完整传过一次到文件末尾（是则不再豁免配额）
+func dlTicketDone(ticket string) bool {
+	if ticket == "" {
+		return false
+	}
+	dlTicketMu.Lock()
+	defer dlTicketMu.Unlock()
+	return dlTickets[ticket].Done
+}
+
+func dlTicketMarkDone(ticket string) {
+	if ticket == "" {
+		return
+	}
+	dlTicketMu.Lock()
+	if rec, ok := dlTickets[ticket]; ok {
+		rec.Done = true
+		dlTickets[ticket] = rec
+	}
+	dlTicketMu.Unlock()
+}
+
+// rangeStartOffset 请求中最靠前的起始字节：无 Range 或无法解析时按 0 计。
+// 用于算出「本次响应本应下发多少字节」，与实写字节比对才能判断是否真传完
+func rangeStartOffset(r *http.Request, size int64) int64 {
+	rg := strings.TrimPrefix(r.Header.Get("Range"), "bytes=")
+	if rg == "" || size <= 0 {
+		return 0
+	}
+	best := size - 1
+	for _, part := range strings.Split(rg, ",") {
+		p := strings.SplitN(strings.TrimSpace(part), "-", 2)
+		if len(p) == 0 || strings.TrimSpace(p[0]) == "" {
+			continue
+		}
+		if start, err := strconv.ParseInt(strings.TrimSpace(p[0]), 10, 64); err == nil && start < best {
+			best = start
+		}
+	}
+	if best < 0 {
+		return 0
+	}
+	return best
+}
+
+// countingWriter 统计一次响应实际写出的字节数，并记下状态码：
+// 只有真正发出内容的 200/206 才算「传过这个文件」，403/404 的 JSON
+// 与确认页 HTML 也累加的话，一次失败的插入请求就能把 Served 顶过文件大小，
+// 让随后的合法续传被判成「已完整传过」而拒发
 type countingWriter struct {
 	http.ResponseWriter
-	n int64
+	n      int64
+	status int
+}
+
+func (c *countingWriter) WriteHeader(code int) {
+	if c.status == 0 {
+		c.status = code
+	}
+	c.ResponseWriter.WriteHeader(code)
+}
+
+// contentSent 本次响应是否真的下发了文件内容（未显式写过 header 时按 200 计，
+// 与 net/http 的隐式 WriteHeader 语义一致）
+func (c *countingWriter) contentSent() bool {
+	s := c.status
+	if s == 0 {
+		s = http.StatusOK
+	}
+	return s == http.StatusOK || s == http.StatusPartialContent
 }
 
 func dlTicketValid(r *http.Request, token string) bool {
@@ -275,7 +362,11 @@ func dlTicketValid(r *http.Request, token string) bool {
 // cookiePath 按「用户当前访问的 /s/<别名或token>」精确限定：别名访问的链接
 // 若把 Cookie Path 绑到真实 token，续传请求（同别名 URL）会带不上 Cookie，
 // 限次链接中途断开就无法续传。返回签发的 ticket（空串表示失败）
-func setDlTicketCookie(w http.ResponseWriter, token, cookiePath string) string {
+//
+// Path 必须按 URL 编码写入：别名允许中文（normalizeAlias），而 Set-Cookie 是
+// 头字段、浏览器按字节做路径匹配，原始 UTF-8 字节会被按 latin-1 解读，
+// 导致下一次请求根本带不上 ticket —— 限次链接的续传直接变 403
+func setDlTicketCookie(w http.ResponseWriter, r *http.Request, token, slug string) string {
 	ticket := newDlTicket(token)
 	if ticket == "" {
 		return ""
@@ -283,10 +374,11 @@ func setDlTicketCookie(w http.ResponseWriter, token, cookiePath string) string {
 	http.SetCookie(w, &http.Cookie{
 		Name:     dlTicketCookie,
 		Value:    ticket,
-		Path:     cookiePath, // 精确作用域：不带入其他接口，也不与其他分享冲突
+		Path:     "/s/" + url.PathEscape(slug),
 		MaxAge:   int(dlTicketTTL / time.Second),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		Secure:   clientScheme(r) == "https",
 	})
 	return ticket
 }
@@ -442,15 +534,21 @@ func tidyEnabled() bool {
 }
 
 // tidyGrace 返回配置的保留时长（小时）：config.json 优先，其次 TIDY_HOURS 环境变量，默认 72
+//
+// 上限 8760（一年）：runTidy 把它放进 time.Duration(h)*time.Hour，极大值会溢出成负数，
+// cutoff 因此落到未来 —— 一次清理就把所有带到期时间的分享记录全删掉。
+// 下限 1：0 或负值同样会让 cutoff 落到现在/未来，效果一样
 func tidyGrace() int {
 	cfgMu.Lock()
-	if cfg.TidyHours > 0 {
-		h := cfg.TidyHours
-		cfgMu.Unlock()
+	h := cfg.TidyHours
+	cfgMu.Unlock()
+	if h > 0 {
+		if h > 8760 {
+			return 8760
+		}
 		return h
 	}
-	cfgMu.Unlock()
-	return envInt("TIDY_HOURS", 72)
+	return envIntRange("TIDY_HOURS", 72, 1, 8760)
 }
 
 // runTidy 立即执行一次清理，返回移除条数
@@ -1036,14 +1134,32 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 	// 首次计数下载时 ticket 是在本请求过程中才签发的（请求里还没有 Cookie），
 	// 所以 issuedTicket 也要一并兜住，否则第一次下载不会被记为「已传完」
 	var issuedTicket string
+	// inline 预览按字节记额度：记下进入预览分支时已写出的字节与该请求身份
+	var previewTok, previewIP string
+	var previewBase int64
+	// 本次响应是否「覆盖到文件末尾」以及应发字节，用于判定 ticket 是否已完整传过
+	var coverEnd bool
+	var coverSpan int64
 	wc := &countingWriter{ResponseWriter: w}
 	w = wc
 	defer func() {
+		// 只有真下发了内容的响应才记账：403/404 的 JSON 与确认页 HTML
+		// 一并累加的话，客户端中途发一个失败请求就能把 ticket 的 Served
+		// 顶过文件大小，让随后的合法续传被判成「已完整传过」而拒发
+		if !wc.contentSent() {
+			return
+		}
 		t := dlTicketOf(r)
 		if t == "" {
 			t = issuedTicket
 		}
 		dlTicketAddServed(t, wc.n)
+		if coverEnd && wc.n >= coverSpan {
+			dlTicketMarkDone(t)
+		}
+		if previewTok != "" {
+			previewCharge(previewTok, previewIP, wc.n-previewBase)
+		}
 	}()
 
 	// 只取一份快照用于判定与渲染，之后不再在锁外读 rec 的字段：
@@ -1087,23 +1203,44 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 403, map[string]any{"error": "链接已过期"})
 		return
 	}
-	// 防盗链：开启后，带 Referer 且域名非本站的请求直接拒绝（直访/下载器不带 Referer 不受影响）
+	// 防盗链：开启后拒绝来自其他站点的页面引用（直访/下载器不受影响）
 	if rec.Hotlink {
+		deny := false
 		if ref := r.Header.Get("Referer"); ref != "" {
 			if u, perr := url.Parse(ref); perr == nil && u.Host != "" {
-				if u.Host != r.Host && u.Host != clientHost(r) {
-					w.Header().Set("Content-Type", "text/html; charset=utf-8")
-					w.Header().Set("Cache-Control", "no-store")
-					w.WriteHeader(http.StatusForbidden)
-					_, _ = w.Write([]byte(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>禁止引用</title></head><body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;color:#5A6478"><p>此链接已开启防盗链，请从原页面打开或直接访问。</p></body></html>`))
-					return
+				// 只与 clientHost(r) 比：它是 r.Host 的超集（未启用反代时相同，
+				// 启用时取可信代理的 X-Forwarded-Host）。旧式还额外与裸 r.Host 比，
+				// 而 Host 是客户端可伪造的头，构造一个与 Referer 同域的 Host 即可放行
+				if u.Host != clientHost(r) {
+					deny = true
 				}
 			}
+		} else if strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "cross-site") {
+			// 只有 Referer 是不够的：`<img referrerpolicy="no-referrer">`、
+			// `<a rel="noopener">` 跳转都会把 Referer 剥干净，旧实现遇 ref=="" 直接放行，
+			// 站外页面只要不发 Referer 就能白嫖。Sec-Fetch-Site 是浏览器维护的
+			// forbidden header，页面脚本改不了，cross-site 即站外引用
+			deny = true
+		}
+		if deny {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>禁止引用</title></head><body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;color:#5A6478"><p>此链接已开启防盗链，请从原页面打开或直接访问。</p></body></html>`))
+			return
 		}
 	}
-	// 先取文件状态：下面的配额豁免判定需要文件大小
+	// 门禁顺序：口令校验必须排在「文件状态结论」和「配额已用完」之前。
+	// 旧顺序是 stat → 配额 403 → 密码门禁，不知道口令的人因此可以拿一个
+	// 受保护的链接反复问，用 404「文件已被删除或移动」与 403「下载次数已用完」
+	// 区分出它的存在性与消耗状态（还顺带写进访问日志），密码形同只挡住了内容
+	givenPw := r.URL.Query().Get("pw")
 	st, err := os.Stat(rec.AbsPath)
-	if err != nil {
+	isDirShare := err == nil && st.IsDir()
+	if rec.PasswordHash != "" && !sharePwGate(w, rec, token, ip, isDirShare, givenPw, logFail) {
+		return
+	}
+	if err != nil { // 口令已确认（或本来就没有口令）才能告知「文件不在了」
 		logFail("文件已被删除或移动")
 		writeJSON(w, 404, map[string]any{"error": "文件已被删除或移动"})
 		return
@@ -1114,11 +1251,19 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 	//
 	// 但豁免必须限定为「上一次传输确实没传完」：否则一次正常下载拿到 ticket 后，
 	// 反复带 Range: bytes=1- 每次都能取到接近完整的文件而永不计数（实测可复现）。
-	// 用 ticket 上累计的已下发字节数判断是否已经完整传过一次。
+	// 判据用 ticket 上的 Done 标记（见 dlTicketRec），而不是「累计字节 >= 文件大小」：
+	// bytes=1- 只发 size-1 字节，按字节和判会永远差一截，等于豁免不掉
 	hasTicket := dlTicketValid(r, token)
 	isResume := hasTicket && rangeStartPositive(r)
-	if isResume && st.Size() > 0 && dlTicketServed(dlTicketOf(r)) >= st.Size() {
+	if isResume && dlTicketDone(dlTicketOf(r)) {
 		isResume = false
+	}
+	// 本次响应若覆盖到末尾，收尾时按「实写字节 >= 应发字节」决定是否标记传完：
+	// 断线时字节不够，标记不成立，下一次续传仍然豁免
+	coverEnd = rangeCoversToEnd(r, st.Size())
+	coverSpan = st.Size() - rangeStartOffset(r, st.Size())
+	if coverSpan < 0 {
+		coverSpan = 0
 	}
 	if rec.MaxDownloads > 0 && rec.Downloads >= rec.MaxDownloads && !isResume {
 		logFail("下载次数已用完")
@@ -1126,7 +1271,6 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 文件夹分享：访问时整体打包为 zip 流式下载（边压缩边传输，不落盘中转）
-	isDirShare := st.IsDir()
 	if isDirShare {
 		// zip 是全量流，不存在「续传片段」语义：持 ticket 的 Range 请求
 		// 每次拿到的都是完整 zip，若沿用 isResume 豁免，一次性文件夹分享
@@ -1146,49 +1290,7 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]any{"error": "文件已被删除或移动"})
 		return
 	}
-	// 密码门禁：无有效密码时渲染输入表单（带防爆破限制）
-	givenPw := r.URL.Query().Get("pw")
-	if rec.PasswordHash != "" {
-		if msg, blocked := sharePwBlocked(token, ip); blocked {
-			logFail("密码错误次数过多，暂时封禁")
-			renderSharePage(w, rec, true, false, givenPw, msg, http.StatusTooManyRequests, isDirShare)
-			return
-		}
-		if givenPw == "" {
-			// 空密码直接按「未提供」渲染表单，不跑 PBKDF2：
-			// 旧的无条件校验让匿名请求每次都烧满 50k 轮（弱设备 CPU DoS），
-			// 且空密码本来就不可能通过非空口令的哈希校验
-			renderSharePage(w, rec, true, false, "", "", http.StatusOK, isDirShare)
-			return
-		}
-		ok, legacy := verifyPwHash(nsShare, givenPw, rec.PasswordHash)
-		if legacy && ok {
-			// 旧分享记录的哈希还是单次 sha256：校验通过后就地升级并落盘
-			shareMu.Lock()
-			if up := hashSharePw(givenPw); up != "" {
-				if l := shares[token]; l != nil {
-					l.PasswordHash = up
-				}
-			}
-			shareMu.Unlock()
-			saveShares()
-		}
-		if !ok {
-			if givenPw != "" {
-				blockedMsg := sharePwRecordFail(token, ip)
-				logFail("密码错误")
-				status := http.StatusOK
-				if blockedMsg != "" {
-					status = http.StatusTooManyRequests
-				}
-				renderSharePage(w, rec, true, true, givenPw, blockedMsg, status, isDirShare)
-				return
-			}
-			renderSharePage(w, rec, true, false, givenPw, "", http.StatusOK, isDirShare)
-			return
-		}
-		sharePwClear(token, ip)
-	}
+	// 密码门禁已前移到文件状态判定之前（见 sharePwGate），此处不再重复校验
 	// 缓存重验证（条件请求）确实不是一次真实的新下载，可以免计次；
 	// 但必须确认服务端「真的会回 304」才豁免 —— 旧实现只看请求头里有没有
 	// If-Modified-Since / If-None-Match 就免计次，任何人加一个 1970 年的时间戳
@@ -1241,7 +1343,7 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 		saveShares()
 		// 只有真实计过次的下载才拿到续传授权，伪造 Range 的头拿不到 ticket；
 		// Cookie Path 用当前 URL 里的别名或 token，保证同 URL 的续传请求能带上
-		issuedTicket = setDlTicketCookie(w, token, "/s/"+urlSlug)
+		issuedTicket = setDlTicketCookie(w, r, token, urlSlug)
 		return true
 	}
 	noQuota := func() {
@@ -1272,15 +1374,19 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 	// 不消耗下载次数（一次性链接「看一眼预览」不该把唯一一次下载烧掉）
 	if r.URL.Query().Get("dl") != "1" {
 		if mediaKind != "" && r.URL.Query().Get("inline") == "1" {
+			// inline 不计数是给「看一眼」用的，但额度必须按实际外发字节记：
+			// 旧实现只在 Range 为空时检查一次布尔标记，于是加一个
+			// `Range: bytes=1-` 就完全绕过这道闸（可反复取回几乎整个文件），
+			// 把文件切成一堆小片段依次请求也同样绕开。改成 token|ip 维度
+			// 累计「一个文件长度 + slack」的额度，超出后一律 429
+			if !previewAllow(token, ip, st.Size()) {
+				writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "预览额度已用完，请通过下载按钮获取文件"})
+				return
+			}
+			previewTok, previewIP, previewBase = token, ip, wc.n
 			// 仅首次完整拉取（无 Range）记一条「预览」访问日志，拖动进度条产生的
 			// Range 片段不记，避免日志被同一播放会话刷屏
 			if r.Header.Get("Range") == "" {
-				// 完整内容预览每 IP 只放行一次：inline 不计数是给「看一眼」用的，
-				// 不限次等于绕过 maxDownloads 无限取回完整文件
-				if !previewAllow(token, ip) {
-					writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "完整预览已获取过，请通过下载按钮获取文件"})
-					return
-				}
 				shareMu.Lock()
 				if l := shares[token]; l != nil {
 					appendShareLog(l, ip, ua, true, "预览")
@@ -1316,7 +1422,14 @@ func serveShareZip(w http.ResponseWriter, rec *Share) {
 	w.WriteHeader(200)
 	zw := zip.NewWriter(w)
 	defer zw.Close()
-	_ = zipAdd(zw, root, rec.AbsPath, rec.Name)
+	if err := zipAdd(zw, root, rec.AbsPath, rec.Name); err != nil {
+		// 头已经发出，改不了状态码：把失败写进包里，否则 defer 的 Close()
+		// 会补出完整的中央目录，对方收到的只是一个「看起来正常」的残缺 zip
+		log.Printf("[分享打包] %s 中断: %v", rec.AbsPath, err)
+		if f, e := zw.Create("_打包失败.txt"); e == nil {
+			fmt.Fprintf(f, "打包在完成前中断，压缩包内容不完整。\n原因：%v\n", err)
+		}
+	}
 }
 
 // renderSharePage 确认页 / 密码输入页（自包含 HTML，不依赖管理端静态资源）
@@ -1372,22 +1485,84 @@ func sharePwClear(token, ip string) {
 	sharePwMu.Unlock()
 }
 
-// previewDone 每个 token|ip 只允许一次「完整内容」的 inline 预览拉取。
-// ?inline=1 不计数是设计使然（一次性链接看一眼预览不该烧掉唯一一次下载），
-// 但完全不限的话，图片/音视频分享可以无限次取回完整字节，maxDownloads 形同虚设。
-// 按 IP 记账（clientIP 已做转发头信任处理，伪造 XFF 打不进来）
-func previewAllow(token, ip string) bool {
+// sharePwGate 分享口令门禁：返回 true 表示已确认口令（或记录本身无口令），
+// 返回 false 表示本函数已经写好响应，调用方必须立即返回。
+//
+// 之所以做成一个独立函数并在 stat/配额判定【之前】调用：门禁留在后面时，
+// 404「文件已被删除或移动」和 403「下载次数已用完」这两种回答都发生在
+// 口令确认之前，等于让受保护链接向不知道口令的人汇报自身状态
+func sharePwGate(w http.ResponseWriter, rec *Share, token, ip string, isDirShare bool, givenPw string, logFail func(string)) bool {
+	if rec.PasswordHash == "" {
+		return true
+	}
+	if msg, blocked := sharePwBlocked(token, ip); blocked {
+		logFail("密码错误次数过多，暂时封禁")
+		renderSharePage(w, rec, true, false, givenPw, msg, http.StatusTooManyRequests, isDirShare)
+		return false
+	}
+	if givenPw == "" {
+		// 空密码直接按「未提供」渲染表单，不跑 PBKDF2：
+		// 旧的无条件校验让匿名请求每次都烧满 50k 轮（弱设备 CPU DoS），
+		// 且空密码本来就不可能通过非空口令的哈希校验
+		renderSharePage(w, rec, true, false, "", "", http.StatusOK, isDirShare)
+		return false
+	}
+	ok, legacy := verifyPwHash(nsShare, givenPw, rec.PasswordHash)
+	if legacy && ok {
+		// 旧分享记录的哈希还是单次 sha256：校验通过后就地升级并落盘
+		shareMu.Lock()
+		if up := hashSharePw(givenPw); up != "" {
+			if l := shares[token]; l != nil {
+				l.PasswordHash = up
+			}
+		}
+		shareMu.Unlock()
+		saveShares()
+	}
+	if !ok {
+		blockedMsg := sharePwRecordFail(token, ip)
+		logFail("密码错误")
+		status := http.StatusOK
+		if blockedMsg != "" {
+			status = http.StatusTooManyRequests
+		}
+		renderSharePage(w, rec, true, true, givenPw, blockedMsg, status, isDirShare)
+		return false
+	}
+	sharePwClear(token, ip)
+	return true
+}
+
+// previewBytes 的额度 = 一个文件长度 + 这么多 slack：播放器会重复请求头部与
+// 重叠区间，卡得太死会让正常预览放不完，太松又等于白送
+const previewSlack = 8 << 20
+
+// previewAllow 判断该 token|ip 还能不能再取 inline 预览内容，额度为一个文件长度。
+//
+// 旧的布尔版「每个 IP 只放行一次无 Range 的请求」拦不住任何东西：
+// 带任意 Range 头就完全跳过这道闸（bytes=1- 即可反复取回几乎整个文件），
+// 把文件按 1KB 切片依次请求也永远不会触发它。两种用法都能让
+// maxDownloads=1 的媒体链接被无限次完整回捞，等于 maxDownloads 形同虚设
+func previewAllow(token, ip string, size int64) bool {
 	key := token + "|" + ip
 	previewMu.Lock()
 	defer previewMu.Unlock()
-	if len(previewDone) > previewMaxIP {
-		previewDone = map[string]bool{} // 粗粒度兜底：极端情况下整体重置，不阻断服务
+	if len(previewBytes) > previewMaxIP && previewBytes[key] == 0 {
+		// 只在超限且自己还没有额度时才整体回收。无条件清空会把正在播放的人
+		// 的记账一并抹掉，等于给每个 IP 重新发一次免费完整拉取
+		previewBytes = map[string]int64{}
 	}
-	if previewDone[key] {
-		return false
+	return previewBytes[key] < size+previewSlack
+}
+
+// previewCharge 累加本次 inline 响应实际外发的字节数
+func previewCharge(token, ip string, n int64) {
+	if n <= 0 {
+		return
 	}
-	previewDone[key] = true
-	return true
+	previewMu.Lock()
+	previewBytes[token+"|"+ip] += n
+	previewMu.Unlock()
 }
 
 // previewGC 回收已不存在分享的预览记录（每小时清理任务调用）
@@ -1396,14 +1571,14 @@ func previewGC() {
 	defer shareMu.Unlock()
 	previewMu.Lock()
 	defer previewMu.Unlock()
-	for k := range previewDone {
+	for k := range previewBytes {
 		i := strings.IndexByte(k, '|')
 		if i <= 0 {
-			delete(previewDone, k)
+			delete(previewBytes, k)
 			continue
 		}
 		if _, ok := shares[k[:i]]; !ok {
-			delete(previewDone, k)
+			delete(previewBytes, k)
 		}
 	}
 }

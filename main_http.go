@@ -22,12 +22,14 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "no-referrer")
-	// CSP：前端仅引用同源资源 + 内联脚本/样式（主题预执行、少量 style 属性）+
-	// favicon data: URL；UAPIs 归属地查询在服务端完成，浏览器端无外部请求。
-	// 即便未来某处出现 XSS，也难以加载外部脚本或外传数据。
+	// CSP：前端仅引用同源资源 + 内联样式（登录页 <style> 块与少量 style 属性）+
+	// favicon data: URL；归属地查询在服务端完成，浏览器端无外部请求。
+	// script-src 不再包含 'unsafe-inline'：两处内联脚本（主题预执行、登录提交）
+	// 已外置为 theme.js / login.js，全仓也没有内联事件属性（onclick= 计数为 0）。
+	// 留着 'unsafe-inline' 就等于把 CSP 的 XSS 兜底作用整体作废
 	w.Header().Set("Content-Security-Policy",
 		"default-src 'self'; "+
-			"script-src 'self' 'unsafe-inline'; "+
+			"script-src 'self'; "+
 			"style-src 'self' 'unsafe-inline'; "+
 			"img-src 'self' data:; "+
 			"connect-src 'self'; "+
@@ -43,13 +45,17 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	if clientScheme(r) == "https" {
 		w.Header().Set("Strict-Transport-Security", "max-age=31536000")
 	}
-	if !checkAuth(w, r) {
-		return
-	}
+	// 访问日志必须在 checkAuth 之前注册：否则 401/429/302 这些拒绝响应
+	// 全部不留痕——而爆破尝试、封禁触发恰好是防爆破与归属地功能最需要审计的事件。
+	// 且必须记 clientIP(r) 而不是 RemoteAddr：开了 trust-proxy 后
+	// 每一行记的都是代理自己的 IP，日志彻底失去定位价值
 	if flagLog {
 		defer func() {
-			log.Printf("%s %s %s", r.Method, r.URL.Path, r.RemoteAddr)
+			log.Printf("%s %s %s", r.Method, r.URL.Path, clientIP(r))
 		}()
+	}
+	if !checkAuth(w, r) {
+		return
 	}
 	p := r.URL.Path
 	// 上传大小限制：只作用于上传接口（不影响登录、自更新等接口的正常请求），
@@ -144,7 +150,13 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 		if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
 			delSession(c.Value)
 		}
-		http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1})
+		// 清除用的属性要和签发时一致（Path=/、HttpOnly、SameSite、Secure），
+		// 否则部分浏览器按属性匹配删除，清不掉旧 cookie
+		http.SetCookie(w, &http.Cookie{
+			Name: sessionCookie, Value: "", Path: "/", MaxAge: -1,
+			HttpOnly: true, SameSite: http.SameSiteLaxMode,
+			Secure: clientScheme(r) == "https",
+		})
 		writeJSON(w, 200, map[string]any{"ok": true})
 	// 版本（?force=1 跳过 10 分钟缓存，前端「检查更新」按钮使用）
 	case p == "/api/version":
@@ -268,12 +280,13 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
 			return
 		}
-		if !atomic.CompareAndSwapInt32(&updBusy, 0, 1) {
+		epoch, okUpd := updAcquire()
+		if !okUpd {
 			s, _, _, _ := getUpd()
 			writeJSON(w, http.StatusConflict, map[string]any{"error": "已有更新任务在进行中（" + s + "）"})
 			return
 		}
-		go runSelfUpdate(strings.TrimSpace(body.To))
+		go runSelfUpdate(epoch, strings.TrimSpace(body.To))
 		writeJSON(w, 200, map[string]any{"started": true})
 	case p == "/api/selfupdate/cancel" && r.Method == http.MethodPost:
 		s, _, _, _ := getUpd()
@@ -313,8 +326,10 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 			},
 		}
 		if hasDir {
-			if total, free, err := diskUsage(rootDir); err == nil {
-				out["disk"] = map[string]int64{"total": total, "free": free}
+			// 显式带 used：前端若用 total-free 反推已用，会把文件系统给 root
+			// 预留的块也算成已用（ext4 默认 5%），磁盘水位显示偏高且各文件系统不一致
+			if total, free, used, err := diskUsage(rootDir); err == nil {
+				out["disk"] = map[string]int64{"total": total, "free": free, "used": used}
 			}
 		}
 		writeJSON(w, 200, out)

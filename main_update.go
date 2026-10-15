@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -438,6 +443,9 @@ func downloadToFile(url, dest string, onProg func(done, total int64), cancelled 
 		}
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			if done+int64(n) > maxReleaseBytes {
+				return abort(fmt.Errorf("下载超过 %d MB 体积上限，已中止", maxReleaseBytes>>20))
+			}
 			if _, werr := f.Write(buf[:n]); werr != nil {
 				return abort(werr)
 			}
@@ -517,8 +525,32 @@ func replaceBinary(src, dst string) error {
 	return os.Rename(src, dst)
 }
 
-// scheduleRestart 延迟重启：systemd 环境走 systemctl；否则 exec 自身（加载新二进制）
-func scheduleRestart() {
+// updAcquire 抢占「同一时刻只有一个更新任务」的名额，返回本次任务的代号。
+// 名额必须带代号才能释放（见 updRelease）：光靠 CAS 挡不住陈旧的清零者
+func updAcquire() (int64, bool) {
+	if !atomic.CompareAndSwapInt32(&updBusy, 0, 1) {
+		return 0, false
+	}
+	return atomic.AddInt64(&updEpoch, 1), true
+}
+
+// updRelease 只有当前持有者才能释放名额。
+// 此前 updBusy 由两处无条件置 0：runSelfUpdate 返回时的 defer，以及
+// scheduleRestart 里那个 1.5 秒后的协程。后者会把期间开始的第二个任务的名额
+// 一起抹掉，于是第三个请求可以挤进来 —— 两个任务同时 os.Create(exe+".new")
+// 交叉写同一个文件，而 validateBinary 只查体积和魔数，混装了新版本的文件照样
+// 通过校验、替换到正在运行的二进制上并被 exec，服务从此起不来且无法自救
+func updRelease(epoch int64) {
+	if atomic.LoadInt64(&updEpoch) != epoch {
+		return
+	}
+	atomic.StoreInt32(&updBusy, 0)
+}
+
+// scheduleRestart 延迟重启：systemd 环境走 systemctl；否则 exec 自身（加载新二进制）。
+// epoch 由调用方交接：armed 之后名额归本函数持有，直到确认「没有重启成功」才释放，
+// 在途窗口内新任务一律 409，避免与 exec/替换过程叠加
+func scheduleRestart(epoch int64) {
 	go func() {
 		time.Sleep(1500 * time.Millisecond)
 		if runtime.GOOS != "windows" {
@@ -533,20 +565,30 @@ func scheduleRestart() {
 				if strings.HasSuffix(exe, " (deleted)") {
 					exe = strings.TrimSuffix(exe, " (deleted)")
 				}
+				// exec 前自己先关监听并刷盘：syscall.Exec 直接换掉进程映像，
+				// srv.Shutdown 与 flushSharesOnExit 都不会执行 —— 每次自更新
+				// 都会丢掉最多 30 秒尚未落盘的分享访问日志，在途请求也被硬切
+				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				shutdownServer(ctx)
+				cancel()
+				flushSharesOnExit()
 				// exec 失败必须如实上报：吞掉错误后无条件报「完成」，
 				// 实际进程还跑在旧二进制上，用户会被假状态误导
 				if errno := syscall.Exec(exe, os.Args, os.Environ()); errno != nil {
 					setUpd("error", "重启失败（"+errno.Error()+"），二进制已替换，请手动重启服务进程")
+					updRelease(epoch)
 					return
 				}
+				return // exec 成功：进程映像已被替换，无需释放名额
 			} else {
 				setUpd("error", "重启失败（无法获取程序路径），二进制已替换，请手动重启服务进程")
+				updRelease(epoch)
 				return
 			}
 		}
 		setUpd("done", "二进制已更新，Windows 请手动重启服务进程")
 		// 没有真正重启（Windows/手动路径）：释放忙碌标志，允许再次发起更新
-		atomic.StoreInt32(&updBusy, 0)
+		updRelease(epoch)
 	}()
 }
 
@@ -565,12 +607,107 @@ func getReleaseByTag(tag string) (*ghRelease, error) {
 	return &rel, nil
 }
 
-func runSelfUpdate(target string) {
-	defer atomic.StoreInt32(&updBusy, 0)
+// updateHTTPClient 元数据与校验文件的请求都用它；
+// 大文件下载另用带 30 分钟总时长上限的专用 client
+var updateHTTPClient = &http.Client{Timeout: 60 * time.Second}
+
+// maxReleaseBytes 自更新产物的体积上限：正常资产十几 MB，给足余量到 512MB。
+// 没有上限时，一个超大资产（或被重定向到的超大目标）会把二进制所在分区写满，
+// 而 .new/.old 落在系统盘上，之后连清理都困难
+const maxReleaseBytes = 512 << 20
+
+// minFreeForUpdate 替换前要求目标目录至少还有这么多空闲：产物 + .old 备份 +
+// 一点余量，磁盘真的写满时报错也比留下一半截强
+const minFreeForUpdate = 128 << 20
+
+// safeTagName GitHub 标签必须只含 URL 路径段安全的字符。
+// tag 来自 API 响应（getReleaseByTag 时还来自请求参数），会被原样拼进下载地址，
+// 含 / ? # 等即可把下载指向非预期的目标
+func safeTagName(s string) bool {
+	if s == "" || len(s) > 100 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '_', r == '-', r == '+':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// releaseDigestMatches 用同一 Release 的 SHA256SUMS 核对已下载的产物。
+// 返回 checked=false 表示该 Release 根本没有 SHA256SUMS（历史版本/手工构建），
+// 此时如实告警后继续；有 sums 而对不上则绝不替换
+func releaseDigestMatches(tag, asset, path string) (ok bool, checked bool) {
+	sumsURL := fmt.Sprintf("https://github.com/%s/releases/download/%s/SHA256SUMS", updateRepo, tag)
+	resp, err := updateHTTPClient.Get(sumsURL)
+	if err != nil {
+		log.Printf("[更新] 取 SHA256SUMS 失败（%v），本次不做完整性校验", err)
+		return true, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[更新] Release %s 没有 SHA256SUMS（HTTP %d），本次不做完整性校验", tag, resp.StatusCode)
+		return true, false
+	}
+	want := ""
+	sc := bufio.NewScanner(io.LimitReader(resp.Body, 1<<20))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// 常见格式 "<hex>  <name>"，也容忍 "<hex> *<name>"
+		f := strings.Fields(line)
+		if len(f) < 2 || !strings.EqualFold(strings.TrimPrefix(f[1], "*"), asset) {
+			continue
+		}
+		want = strings.ToLower(f[0])
+		break
+	}
+	if want == "" {
+		log.Printf("[更新] SHA256SUMS 里没有 %s，不做完整性校验", asset)
+		return true, false
+	}
+	hf, err := os.Open(path)
+	if err != nil {
+		return false, true
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, hf); err != nil {
+		hf.Close()
+		return false, true
+	}
+	hf.Close()
+	got := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(got, want) {
+		log.Printf("[更新] %s 摘要不符：期望 %s，实得 %s", asset, want, got)
+		return false, true
+	}
+	log.Printf("[更新] %s 摘要校验通过", asset)
+	return true, true
+}
+
+func runSelfUpdate(epoch int64, target string) {
+	// armed 后名额交给 scheduleRestart：在「二进制已换、进程还没重启」的窗口里
+	// 必须继续挡住新任务，否则下一次更新会与即将 exec 的这次叠在一起
+	armed := false
+	defer func() {
+		if !armed {
+			updRelease(epoch)
+		}
+	}()
 	atomic.StoreInt32(&updCancel, 0) // 新任务清空取消标志
 	setUpdProg("downloading", "查询最新版本…", 0, -1)
 	// 指定目标版本时按 tag 精确取 Release，而不是无条件拉最新
 	// （此前 target 参数被忽略，无论传什么都更新到最新版）
+	if target != "" && !safeTagName(target) {
+		setUpd("error", "版本标签不合法")
+		return
+	}
 	var rel *ghRelease
 	var err error
 	if target != "" {
@@ -586,6 +723,15 @@ func runSelfUpdate(target string) {
 		setUpd("idle", "已取消更新")
 		return
 	}
+	if !safeTagName(rel.TagName) {
+		setUpd("error", "版本标签不合法，已取消")
+		return
+	}
+	if target != "" && rel.TagName != target {
+		// API 返回了别的 tag（大小写或跳转），不能拿它去拼下载地址
+		setUpd("error", "服务端返回的版本与请求不一致，已取消")
+		return
+	}
 	// 指定版本允许平级重装与回退（旧版本往往才是用户想要的版本），
 	// 只有「更新到最新」时才要求版本号必须递增
 	if target == "" && !verGreater(rel.TagName, curVersion()) {
@@ -593,16 +739,22 @@ func runSelfUpdate(target string) {
 		return
 	}
 	asset := assetName()
-	url := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", updateRepo, rel.TagName, asset)
+	dlURL := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", updateRepo, rel.TagName, asset)
 	exe, err := os.Executable()
 	if err != nil {
 		setUpd("error", "获取程序路径失败: "+err.Error())
 		return
 	}
 	exe, _ = filepath.Abs(exe)
+	// 落盘前先看空间：diskUsage 在整个项目里原本只被 /api/state 调过一次，
+	// 从没在写二进制前查过，磁盘满时下载会一路 ENOSPC 并把目录搞脏
+	if _, free, _, derr := diskUsage(filepath.Dir(exe)); derr == nil && free < minFreeForUpdate {
+		setUpd("error", fmt.Sprintf("目标分区剩余空间不足（%d MB），请先清理后再更新", free>>20))
+		return
+	}
 	tmp := exe + ".new"
 	setUpdProg("downloading", "下载 "+asset+" …", 0, -1)
-	err = downloadToFile(url, tmp,
+	err = downloadToFile(dlURL, tmp,
 		func(done, total int64) { setUpdProg("downloading", "下载 "+asset, done, total) },
 		updCancelled)
 	if err == errUpdateCancelled {
@@ -618,6 +770,13 @@ func runSelfUpdate(target string) {
 		setUpd("idle", "已取消更新")
 		return
 	}
+	// 下载完先对摘要：validateBinary 只看体积和魔数，挡不住
+	// 「Release 资产被替换」或「中间人交来的另一份可执行文件」
+	if ok, _ := releaseDigestMatches(rel.TagName, asset, tmp); !ok {
+		_ = os.Remove(tmp)
+		setUpd("error", "SHA256SUMS 校验不通过，已取消替换")
+		return
+	}
 	setUpd("replacing", "替换二进制…")
 	if err := replaceBinary(tmp, exe); err != nil {
 		_ = os.Remove(tmp)
@@ -625,7 +784,8 @@ func runSelfUpdate(target string) {
 		return
 	}
 	setUpd("restarting", "已更新到 "+rel.TagName+"，服务重启中…")
-	scheduleRestart()
+	armed = true
+	scheduleRestart(epoch)
 }
 
 func selfUpdateJSON() map[string]any {
@@ -641,16 +801,22 @@ func selfUpdateJSON() map[string]any {
 // handleSelfUpdateUpload 手动上传更新包：服务器连不上 GitHub 时的本地替代路径。
 // 接收 multipart 的 file 字段 -> 落盘 -> 校验魔数 -> 原子替换 -> 重启。
 func handleSelfUpdateUpload(w http.ResponseWriter, r *http.Request) {
-	if !atomic.CompareAndSwapInt32(&updBusy, 0, 1) {
+	epoch, okUpd := updAcquire()
+	if !okUpd {
 		s, _, _, _ := getUpd()
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "已有更新任务在进行中（" + s + "）"})
 		return
 	}
-	// 成功路径（scheduleRestart 后进程未退出/重启失败）也要释放忙碌标志，
+	// armed 后名额交给 scheduleRestart；其余路径必须释放，
 	// 否则之后所有 selfupdate 请求永久 409
-	defer atomic.StoreInt32(&updBusy, 0)
+	armed := false
+	defer func() {
+		if !armed {
+			updRelease(epoch)
+		}
+	}()
 	fail := func(code int, msg string) {
-		atomic.StoreInt32(&updBusy, 0)
+		updRelease(epoch)
 		setUpd("idle", "")
 		writeJSON(w, code, map[string]any{"error": msg})
 	}
@@ -710,7 +876,7 @@ func handleSelfUpdateUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := validateBinary(tmp, n); err != nil {
-		atomic.StoreInt32(&updBusy, 0)
+		updRelease(epoch)
 		setUpd("error", "校验失败: "+err.Error())
 		writeJSON(w, 400, map[string]any{"error": err.Error()})
 		return
@@ -718,12 +884,13 @@ func handleSelfUpdateUpload(w http.ResponseWriter, r *http.Request) {
 	setUpd("replacing", "替换二进制…")
 	if err := replaceBinary(tmp, exe); err != nil {
 		_ = os.Remove(tmp)
-		atomic.StoreInt32(&updBusy, 0)
+		updRelease(epoch)
 		setUpd("error", "替换失败: "+err.Error())
 		writeJSON(w, 500, map[string]any{"error": "替换失败: " + err.Error()})
 		return
 	}
 	setUpd("restarting", "二进制已更新，服务重启中…")
-	scheduleRestart()
+	armed = true
+	scheduleRestart(epoch)
 	writeJSON(w, 200, map[string]any{"started": true})
 }

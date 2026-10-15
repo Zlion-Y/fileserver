@@ -9,8 +9,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # 构建 job 只产出 artifact，用不到仓库写权限；写权限只留给真正要建 Release 的 job
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -164,6 +165,20 @@ jobs:
           cat body.md
       - uses: actions/download-artifact@v4
         with: { path: dist, merge-multiple: true }
+      # build 用的是 fail-fast: false，某个架构挂了其余照样成功；没有这道门禁时，
+      # release job 会把「幸存下来」的那几个文件哈希进 SHA256SUMS 并发布出去 ——
+      # 半套 Release 比构建失败更糟：装机脚本要到本机架构 404 时才暴露问题
+      - name: 校验产物齐全（9 个平台缺一不发布）
+        run: |
+          cd dist
+          missing=0
+          for a in fileserver_linux_amd64 fileserver_linux_arm64 fileserver_linux_armv7 \
+                   fileserver_linux_armv5 fileserver_linux_386 fileserver_linux_mipsle \
+                   fileserver_windows_amd64.exe fileserver_darwin_amd64 fileserver_darwin_arm64; do
+            if [ ! -s "$a" ]; then echo "缺少产物：$a"; missing=1; fi
+          done
+          if [ "$missing" != 0 ]; then echo "产物不齐全，拒绝发布半套 Release"; exit 1; fi
+          echo "9 个平台产物齐全"
       # 生成 SHA256SUMS：install-remote.sh / 用户下载后可校验完整性
       - name: 生成 SHA256SUMS
         run: |
