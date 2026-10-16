@@ -557,6 +557,14 @@ func checkAuth(w http.ResponseWriter, r *http.Request) bool {
 		p == "/login" || p == "/api/login" || p == "/api/logout" {
 		return true
 	}
+	// 登录页自己的脚本必须免密可取。v1.8.0 为了把 CSP 的 script-src 收紧到
+	// 'self'，把 login.html 的内联脚本外置成了 /login.js —— 而下面那条
+	// 「未登录访问静态资源一律 302 到 /login」会把这个脚本一起拦掉，
+	// 结果是登录页拿到 HTML 却装不上提交逻辑，任何人都登不进去（自锁）。
+	// 按精确文件名放行：不含目录成分，serveStatic 走 embed 名查表，无穿越面
+	if p == "/login.js" {
+		return true
+	}
 	// 管理界面与静态资源：未登录一律 302 到登录页。
 	// 旧实现页面壳公开——虽然数据全走 API，但后台的菜单结构、按钮布局、
 	// 全部 API 端点都写在 index.html 与 app.js 里，等于向未登录访客

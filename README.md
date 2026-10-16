@@ -23,7 +23,8 @@ Go 实现（零第三方库），前端经 `//go:embed` 编译进二进制，拷
 | 分享密码 | 分享链接可设访问密码（PBKDF2 哈希校验），密码以 AES-GCM 加密存储，管理端可查看/复制 |
 | 自定义别名 | 分享链接可设自定义尾段（如 `/s/发布会-materials`，中英文/数字/-/_），对外发布更好看，原 token 链接同样有效 |
 | 防盗链 | 分享可开启 Referer 校验，拒绝其他网站的页面引用（直访与下载工具不受影响），按分享开关 |
-| 分享文件夹 | 文件夹也可分享：访问时流式打包 ZIP 下载（边压缩边传输，不占服务器磁盘）；多选文件可「打包下载 ZIP」 |
+| 分享文件夹 | 文件夹分享打开是**目录列表页**（名称/体积/修改时间），点单个文件只下它一个、点文件夹名继续往下钻，也可以随时「打包下载此目录」；回收站内容与未完成的上传半成品不出现在列表里 |
+| 静态网页托管 | 文件夹分享勾选「作为静态网页发布」后，链接就是一个小网站：目录里放 `index.html`，复制链接直接在浏览器里打开，页面里相对引用的 css/js/图片/子目录都从同一条链接取（借鉴 dufs 把目录当站点服务）。浏览与资源加载**不消耗下载次数** |
 | 二维码 | 生成分享链接后同屏展示二维码（纯前端生成，零依赖），手机扫码即下 |
 | 回收站 | 删除先进回收站（同盘原子 rename），可逐条或勾选批量恢复/彻底删除；超过 `TRASH_DAYS`（默认 7 天，0 = 永久保留）自动清理 |
 | 媒体预览 | 图片/视频/音频在浏览器内直接预览与播放（客户端渲染，服务端只透传文件流，视频音频支持拖动） |
@@ -181,7 +182,7 @@ sudo nginx -t && sudo systemctl reload nginx
 | POST | `/api/upload?path=` | multipart 上传，字段名 `files` |
 | DELETE | `/api/item?path=` | 删除文件或目录 |
 | GET | `/api/download?path=` | 直接下载（管理端） |
-| POST | `/api/share` | 创建分享：`path / expireSeconds / maxDownloads / scheme / host` |
+| POST | `/api/share` | 创建分享：`path / expireSeconds / maxDownloads / scheme / host / password / mode / alias / hotlink / site`（`site=true` 仅文件夹，见下） |
 | GET | `/api/shares` | 分享列表 |
 | GET | `/api/sharelog?token=` | 分享访问日志（最近 50 条：IP / UA / 成败 / 失败原因） |
 | GET | `/api/ipgeo?ips=a,b,c` | 批量查询 IP 归属地（单批 ≤30，并发 ≤4；数据源 UAPIs，区县级 + 运营商；配置 `UAPI_KEY` 或 `data/config.json` 的 `uapiKey` 走计费额度，默认访客积分） |
@@ -192,7 +193,8 @@ sudo nginx -t && sudo systemctl reload nginx
 | POST | `/api/trash/purge` | 彻底删除单个条目 |
 | POST | `/api/trash/clear` | 清空回收站 |
 | GET | `/api/list` | 文件列表（可选 `offset/limit/sort/filter/size` 分页与服务端排序筛选；带 `limit` 时返回 `total/hasMore`） |
-| GET | `/s/:token` | 分享下载（校验有效期与次数；文件夹分享为流式 ZIP） |
+| GET | `/s/:token` | 分享下载（校验有效期与次数）。文件分享直接给文件；文件夹分享给目录列表，`/s/:token/<子路径>` 按需取单个文件，`?dl=1` 为整包 ZIP |
+| GET | `/s/:alias/…` | 别名链接与 token 链接等价；勾选「静态网页发布」的文件夹，`/s/:alias/` 直接渲染目录内的 `index.html`，相对引用的资源从同一路径前缀取 |
 | 任意 | `/dav/*` | WebDAV（OPTIONS/PROPFIND/GET/HEAD/PUT/MKCOL/DELETE/MOVE/PROPPATCH） |
 | GET | `/healthz` | 健康检查 |
 
@@ -210,7 +212,7 @@ Salt Player / foobar2000 / 常规移动端文件管理器均可正常使用。�
 ## 注意事项
 
 - **分享记录存于 `DATA_DIR/shares.json`**，容器重建时若该目录未持久化，已有链接会全部失效。
-- 反代场景务必设置 `TRUST_PROXY=1`，否则生成的链接会变成 `http://127.0.0.1:16666/...`。
+- 反代场景务必设置 `TRUST_PROXY=1`，否则生成的链接会变成 `http://127.0.0.1:16666/...`。反代与服务在同一台机器时（环回来源）即可生效；不在同一台机器还要把代理网段写进 `TRUSTED_PROXIES`。
 - Nginx 需放开 `client_max_body_size 0` 并关闭 `proxy_buffering`（`deploy/nginx.conf` 已配置）。
 - 公网部署请务必设置 `AUTH_USER` / `AUTH_PASS`，否则任何人都能管理文件。设置后未登录只能看到登录页（管理界面、静态资源全部需要会话或 Basic 认证）。
 - 上传采用 multipart 流式写盘：逐 part 直接写入目标目录，不经系统临时盘中转，不受内存/32MB 阈值限制；同名文件自动追加 `(1)`、`(2)` 后缀（排他创建，并发上传不会互相覆盖）；上传目标子目录不存在时自动创建。
@@ -218,5 +220,8 @@ Salt Player / foobar2000 / 常规移动端文件管理器均可正常使用。�
 - 大目录：列表按页拉取（每页 500 项）+ 前端虚拟滚动，仅渲染可见行；排序/类型/大小筛选由服务端在分页前完成。
 - 超过 `MAX_UPLOAD_MB` 的文件会立即中断并删除半成品，返回 413。
 - Docker 构建可传 `--build-arg VERSION=v1.2.3` 注入版本号；未注入时版本为 `dev`（非发布版本），网页会禁用一键更新（容器内应重新构建镜像，而非替换二进制）。
-- 反向代理场景开启 `TRUST_PROXY=1` 后，仅当直连来源为环回/内网地址时才采信 `X-Forwarded-For`，端口直接暴露公网时伪造 XFF 无效。
+- 反向代理：开启 `TRUST_PROXY=1` 后，**只有直连来源是环回（同机反代）或 `TRUSTED_PROXIES` 里显式列出的网段**才采信 `X-Real-IP` / `X-Forwarded-For`。内网地址段本身不代表可信 —— 端口被直接发布时来源 IP 常常就是 docker 网桥，旧判据会让客户端自己声明 IP，从而绕过按 IP 记账的登录封禁。
+- **v1.8.0 起 `TRUST_PROXY` 默认关闭**，且不再默认信任内网来源；反代不在同一台机器时，升级后必须补 `TRUSTED_PROXIES=<代理网段 CIDR>`，否则登录封禁会记在代理 IP 上、访问日志与 IP 归属地也全是代理地址。
+- **文件夹分享的行为变更（v1.9.0）**：打开目录链接不再是「立即下整个 zip」，而是目录列表 + 按需取单个文件。计次语义：默认每取用一个文件计一次（`maxDownloads` 依然有效），列表浏览本身不计；勾选「作为静态网页发布」后浏览与子资源一律不计次，只有显式 `?dl=1` 计次。整包 zip 仍在，地址是 `<目录链接>?dl=1`。
+- 静态网页发布是**把该目录当作与本站同源的页面渲染**：页面里的脚本在同一 origin 下运行、可以访问 `/api`。因此只放自己写的 HTML，不要用它托管不可信来源的网页。（发布的页面仍受链接的有效期/密码/次数与防盗链约束。）
 - 路径参数均做了根目录越权校验，无法通过 `../` 访问目录以外的文件。

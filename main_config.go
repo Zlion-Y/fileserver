@@ -48,20 +48,30 @@ type Share struct {
 	LastDownloadAt int64  `json:"lastDownloadAt,omitempty"`
 	// PasswordEnc AES-GCM(主密钥) 加密后的分享密码，管理端回显时解密；
 	// 不再把明文直接写进 shares.json（该文件 0644，备份/volume 泄露会连带交出所有分享密码）
-	PasswordEnc    string     `json:"passwordEnc,omitempty"`
-	LegacyPassword string     `json:"password,omitempty"`     // 兼容旧版本遗留明文，加载时迁移后清空，不再落盘
-	Password       string     `json:"-"`                      // 仅内存字段：管理端回显用，绝不持久化
-	PasswordHash   string     `json:"passwordHash,omitempty"` // PBKDF2 口令哈希，空 = 无密码
-	Mode           string     `json:"mode,omitempty"`         // "" = 直链下载（兼容旧记录），"page" = 确认页
-	Alias          string     `json:"alias,omitempty"`        // 自定义链接别名：/s/<alias>，对外发布更好看
-	Hotlink        bool       `json:"hotlink,omitempty"`      // 防盗链：带 Referer 且来源域名非本站时拒绝
-	Log            []ShareLog `json:"log,omitempty"`
+	PasswordEnc    string `json:"passwordEnc,omitempty"`
+	LegacyPassword string `json:"password,omitempty"`     // 兼容旧版本遗留明文，加载时迁移后清空，不再落盘
+	Password       string `json:"-"`                      // 仅内存字段：管理端回显用，绝不持久化
+	PasswordHash   string `json:"passwordHash,omitempty"` // PBKDF2 口令哈希，空 = 无密码
+	Mode           string `json:"mode,omitempty"`         // "" = 直链下载（兼容旧记录），"page" = 确认页
+	Alias          string `json:"alias,omitempty"`        // 自定义链接别名：/s/<alias>，对外发布更好看
+	Hotlink        bool   `json:"hotlink,omitempty"`      // 防盗链：带 Referer 且来源域名非本站时拒绝
+	// Site 文件夹分享的「静态网页发布」开关（借鉴 dufs 把一个目录当站点服务）：
+	// 打开后 /s/<别名>/ 直接渲染目录里的 index.html，页面里的相对路径可从
+	// /s/<别名>/<文件> 取到，浏览与子资源加载不消耗下载次数（内容是所有者主动对外
+	// 发布的网页，限次语义留给 ?dl=1 的显式下载）；目录里没有 index.html 时
+	// 回落到列表页。关闭时（默认）也能浏览列表，但每个文件的取都计一次，
+	// maxDownloads 不会被「逐个翻看」架空
+	Site bool       `json:"site,omitempty"`
+	Log  []ShareLog `json:"log,omitempty"`
 }
 
 type sharePublic struct {
 	Share
-	Alive    bool   `json:"alive"`
-	HasPw    bool   `json:"hasPw"`
+	Alive bool `json:"alive"`
+	HasPw bool `json:"hasPw"`
+	// IsDir 让管理端能判断这条分享是不是文件夹（Size 对目录存的是 0，
+	// 而 0 字节的文件同样是 0，不能拿来当目录判据）
+	IsDir    bool   `json:"isDir"`
 	Password string `json:"password,omitempty"` // 解密后的明文，仅 /api/shares 等管理端接口返回
 }
 

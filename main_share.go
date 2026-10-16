@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -92,11 +94,15 @@ func publicOne(s *Share) sharePublic {
 	c.LegacyPassword = ""
 	c.Log = nil
 	pw := c.Password
+	isDir := false
 	if pw == "" && c.PasswordEnc != "" {
 		pw, _ = decryptPw(c.PasswordEnc)
 	}
 	c.Password = ""
-	return sharePublic{Share: c, Alive: aliveShare(s), HasPw: s.PasswordHash != "", Password: pw}
+	if st, err := os.Stat(s.AbsPath); err == nil {
+		isDir = st.IsDir()
+	}
+	return sharePublic{Share: c, Alive: aliveShare(s), HasPw: s.PasswordHash != "", IsDir: isDir, Password: pw}
 }
 
 // setSharePassword 统一写入分享密码：密文明文双份（明文仅在内存） + PBKDF2 哈希
@@ -598,6 +604,7 @@ func handleShareCreate(w http.ResponseWriter, r *http.Request, root string) {
 		Host          string `json:"host"`
 		Password      string `json:"password"` // 空 = 无密码
 		Mode          string `json:"mode"`     // "direct"（默认）| "page"
+		Site          bool   `json:"site"`     // 文件夹分享：作为静态网页发布（浏览不计次）
 		Alias         string `json:"alias"`    // 可选：自定义链接别名
 		Hotlink       bool   `json:"hotlink"`  // 可选：防盗链
 	}
@@ -650,10 +657,15 @@ func handleShareCreate(w http.ResponseWriter, r *http.Request, root string) {
 		writeJSON(w, 400, map[string]any{"error": "文件不存在"})
 		return
 	}
-	// 文件夹也可以分享：访问时流式打包 zip 下载（不占服务器磁盘）
+	// 文件夹也可以分享：默认给列表页按需取单个文件，也可整包 zip 下载；
+	// Site 打开时把目录当静态网站发布（index.html 作为目录索引，浏览不计次）
 	size := st.Size()
 	if st.IsDir() {
 		size = 0
+	}
+	if body.Site && !st.IsDir() {
+		writeJSON(w, 400, map[string]any{"error": "「作为静态网页发布」只支持文件夹"})
+		return
 	}
 	// 输入校验：负数会让「限次」静默变成不限次（alive 判定用 >0），
 	// 负的过期时间也会被 >0 判断吞掉，二者都必须显式拒绝而不是静默忽略
@@ -692,6 +704,7 @@ func handleShareCreate(w http.ResponseWriter, r *http.Request, root string) {
 		Mode:         "",
 		Alias:        alias,
 		Hotlink:      body.Hotlink,
+		Site:         body.Site,
 	}
 	if body.Mode == "page" {
 		rec.Mode = "page"
@@ -755,6 +768,7 @@ func handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 		Mode      *string `json:"mode"`      // "direct"（默认）| "page"；null = 不修改
 		Alias     *string `json:"alias"`     // 可选：null = 不修改；"" = 清除别名
 		Hotlink   *bool   `json:"hotlink"`   // 可选：null = 不修改
+		Site      *bool   `json:"site"`      // 可选：文件夹「静态网页发布」开关；null = 不修改
 	}
 	if err := decodeStrict(w, r, &body); err != nil {
 		writeJSON(w, 400, map[string]any{"error": "请求参数错误: " + err.Error()})
@@ -804,6 +818,9 @@ func handleShareUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Hotlink != nil {
 		rec.Hotlink = *body.Hotlink
+	}
+	if body.Site != nil {
+		rec.Site = *body.Site
 	}
 	if body.Password != nil {
 		pw := strings.TrimSpace(*body.Password)
@@ -1109,16 +1126,22 @@ func fmtSizeGo(b int64) string {
 
 // handleShareGet 分享访问入口：密码门禁 -> 确认页/直链 -> 计数与日志
 func handleShareGet(w http.ResponseWriter, r *http.Request) {
-	token := strings.TrimPrefix(r.URL.Path, "/s/")
-	if i := strings.Index(token, "/"); i >= 0 {
-		token = token[:i]
-	}
-	// URL 里的原始别名/token（Cookie Path 要与它一致，续传请求才带得上 ticket）
-	urlSlug := token
-	if token == "" {
+	// /s/<别名或token>[/<目录分享内的子路径>]
+	// 子路径只对「文件夹分享」有意义（列表浏览、按需下载单个文件、静态网页的
+	// 相对资源）；文件分享仍然忽略子路径，保持历史链接的行为
+	full := strings.TrimPrefix(r.URL.Path, "/s/")
+	if full == "" {
 		writeJSON(w, 404, map[string]any{"error": "缺少 token"})
 		return
 	}
+	urlSlug := full
+	sub := ""
+	if i := strings.Index(full, "/"); i >= 0 {
+		urlSlug = full[:i]
+		sub = full[i+1:]
+	}
+	token := urlSlug
+	// URL 里的原始别名/token（Cookie Path 要与它一致，续传请求才带得上 ticket）
 	// 只接受 GET/HEAD：POST 等非下载动作不计数也不返回内容，
 	// 否则任意构造 POST /s/xxx 就能把一次性链接的下载次数烧光
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -1265,17 +1288,13 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 	if coverSpan < 0 {
 		coverSpan = 0
 	}
-	if rec.MaxDownloads > 0 && rec.Downloads >= rec.MaxDownloads && !isResume {
+	// 门口的配额判定只适用于文件分享。文件夹分享改为「列表 + 按需取用」后，
+	// 浏览列表 / 站点渲染本身不计次（见 serveShareDir），次数在真正下发文件时
+	// 才扣；因此不能在这里一刀切 403，否则配额用尽后连目录都打不开
+	if !isDirShare && rec.MaxDownloads > 0 && rec.Downloads >= rec.MaxDownloads && !isResume {
 		logFail("下载次数已用完")
 		writeJSON(w, 403, map[string]any{"error": "下载次数已用完"})
 		return
-	}
-	// 文件夹分享：访问时整体打包为 zip 流式下载（边压缩边传输，不落盘中转）
-	if isDirShare {
-		// zip 是全量流，不存在「续传片段」语义：持 ticket 的 Range 请求
-		// 每次拿到的都是完整 zip，若沿用 isResume 豁免，一次性文件夹分享
-		// 会被无限次完整下载。文件夹一律按新下载计次（HEAD 仍豁免）
-		isResume = false
 	}
 	// 媒体文件支持浏览器内预览（客户端渲染，服务端仅透传）：
 	// - 直链模式：内联返回，对方在浏览器里直接看到/播放（仍按下载计数）
@@ -1302,15 +1321,8 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 	// HEAD 不是真实下载：下载器/IM/邮件客户端的链接预检都会先发 HEAD，
 	// 若计次会「看一眼就把一次性链接打死」，因此与续传同样处理
 	isHead := r.Method == http.MethodHead
-	// HEAD 请求文件夹分享：只回响应头，不做完整遍历+压缩
-	// （旧实现 HEAD 也全量打包，零配额消耗 CPU/IO 且不留访问日志无法审计）
-	if isDirShare && isHead {
-		w.Header().Set("Content-Type", "application/zip")
-		w.Header().Set("Content-Disposition", contentDisposition("attachment", rec.Name)+".zip")
-		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(200)
-		return
-	}
+	// 文件夹分享从这里整条分流到 serveShareDir（列表 / 单文件 / 站点 / ?dl=1 打包），
+	// 下面剩下的都是单文件分享的路径
 	// 「到文件末尾」的传输（无 Range 或 Range 覆盖到末尾）持票并发互斥：
 	// 防止一次合法计次后 N 个并发 Range: bytes=1- 同时通过准入、
 	// 每条都拿到接近完整的文件（ticket 的 Served 在响应结束才累加）
@@ -1350,6 +1362,11 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 		logFail("下载次数已用完")
 		writeJSON(w, 403, map[string]any{"error": "下载次数已用完"})
 	}
+	// 文件夹分享：列表浏览 + 单文件按需下载 + 可选的静态网页发布 + ?dl=1 整包 zip
+	if isDirShare {
+		serveShareDir(w, r, rec, token, urlSlug, sub, ip, ua, logFail, countOnce, noQuota)
+		return
+	}
 	// 直链模式（默认，与历史行为一致）：链接即下载。
 	// 计数在发送文件【之前】同步完成：一次性链接首次请求即消耗配额，
 	// 客户端中断/并发连接/预取都无法绕过；经授权的续传片段与 HEAD 除外
@@ -1358,9 +1375,7 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 			noQuota()
 			return
 		}
-		if isDirShare {
-			serveShareZip(w, rec)
-		} else if mediaKind != "" {
+		if mediaKind != "" {
 			// 图片/视频/音频：内联返回，对方打开链接直接在浏览器里看到而非弹下载；
 			// 保存/另存为仍可用，下载器拿到的也是完整文件
 			serveInline(w, r, rec.AbsPath, rec.Name)
@@ -1405,27 +1420,288 @@ func handleShareGet(w http.ResponseWriter, r *http.Request) {
 		noQuota()
 		return
 	}
-	if isDirShare {
-		serveShareZip(w, rec)
-	} else {
-		serveDownload(w, r, rec.AbsPath, rec.Name)
-	}
+	serveDownload(w, r, rec.AbsPath, rec.Name)
 }
 
-// serveShareZip 文件夹分享的流式 zip 下载（与密码门禁/计数逻辑解耦，仅负责输出）。
-// root 传入根目录：打包时排除根级回收站（已删除文件不得借分享外泄）
-func serveShareZip(w http.ResponseWriter, rec *Share) {
-	root, _ := getRoot()
+// shareHitsTrash 子路径的第一段是否落在回收站目录名上。
+// 根目录被分享时 .trash 就在里面，已删除的内容不能借目录分享外泄；
+// 大小写不敏感文件系统（Windows/macOS）上 .TRASH 是同一个目录，一并拦
+func shareHitsTrash(sub string) bool {
+	first := sub
+	if i := strings.IndexByte(first, '/'); i >= 0 {
+		first = first[:i]
+	}
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		return strings.EqualFold(first, trashDirName)
+	}
+	return first == trashDirName
+}
+
+// shareSubResolve 把目录分享里的子路径解析到该分享目录内的真实路径。
+// 边界是「本条分享的目录」而不是根目录：不能向上越出分享范围去取兄弟目录。
+// safeJoin 用 filepath.Rel 判包含（挡 .. 与 /root vs /root-evil 那类前缀陷阱），
+// realPathInside 再挡「分享建立之后把子目录换成指向外部的符号链接」这种情况
+func shareSubResolve(shareDir, sub string) (string, error) {
+	if sub == "" {
+		return shareDir, nil
+	}
+	if strings.IndexByte(sub, 0) >= 0 || shareHitsTrash(sub) {
+		return "", errors.New("非法路径")
+	}
+	p, err := safeJoin(shareDir, "/"+sub)
+	if err != nil {
+		return "", err
+	}
+	if !realPathInside(shareDir, p) {
+		return "", errors.New("非法路径")
+	}
+	return p, nil
+}
+
+// serveShareStatic 站点模式下把目录内的一个文件当网页资源内联下发。
+// 与 serveInline 的差别只在 CSP：发布的页面里常见内联 <script>/<style>，
+// 全站那条 script-src 'self' 会让页面白屏，所以这里给站点响应换成
+// 「同源 + 允许内联、禁止外部与嵌套」的版本；frame-ancestors 仍为 none
+func serveShareStatic(w http.ResponseWriter, r *http.Request, path, name string, render bool) {
+	if render {
+		switch strings.ToLower(filepath.Ext(name)) {
+		case ".html", ".htm":
+			w.Header().Set("Content-Security-Policy",
+				"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "+
+					"img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; "+
+					"connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+		}
+	}
+	serveInline(w, r, path, name)
+}
+
+// shareDirListing 列表页的一行
+type shareDirListing struct {
+	name  string
+	isDir bool
+	size  int64
+	mod   time.Time
+}
+
+// renderShareDirPage 目录列表页（借鉴 dufs 的 --render-try-index 之外的浏览体验：
+// 看得到目录里有什么、按 need 单个取用，而不是必须整包 zip）
+func renderShareDirPage(w http.ResponseWriter, r *http.Request, rec *Share, slug string, dirAbs string, rows []shareDirListing, zipURL string) {
+	// 当前目录相对分享根的路径，逐段 URL 编码后再拼链接：
+	// 目录名允许中文/空格，裸拼进 href 会让相对解析整片错位
+	rel := filepath.ToSlash(strings.TrimPrefix(strings.TrimPrefix(dirAbs, rec.AbsPath), string(filepath.Separator)))
+	segs := []string{}
+	if rel != "" && rel != "." {
+		for _, s := range strings.Split(rel, "/") {
+			if s != "" {
+				segs = append(segs, s)
+			}
+		}
+	}
+	base := "/s/" + url.PathEscape(slug) + "/"
+	for _, s := range segs {
+		base += url.PathEscape(s) + "/"
+	}
+	title := rec.Name
+	if len(segs) > 0 {
+		title = rec.Name + " / " + strings.Join(segs, "/")
+	}
+	// 上一级：/s/slug/a/b/ -> /s/slug/a/；分享根没有上级，留空不渲染
+	parent := ""
+	if len(segs) > 0 {
+		parent = "/s/" + url.PathEscape(slug) + "/"
+		for _, s := range segs[:len(segs)-1] {
+			parent += url.PathEscape(s) + "/"
+		}
+	}
+	var b strings.Builder
+	b.WriteString(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">` +
+		`<meta name="viewport" content="width=device-width, initial-scale=1">` +
+		`<meta name="robots" content="noindex,nofollow"><title>` + htmlEsc(title) + ` · 分享目录</title><style>` +
+		`body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif;margin:0;background:#F4F6FA;color:#1C1C2E}` +
+		`.wrap{max-width:880px;margin:0 auto;padding:24px 16px 64px}` +
+		`.hd{display:flex;flex-wrap:wrap;align-items:baseline;gap:12px;margin-bottom:8px}` +
+		`h1{font-size:19px;margin:0;word-break:break-all}` +
+		`.meta{font-size:13px;color:#5A6478}` +
+		`.btn{display:inline-block;padding:8px 14px;border-radius:10px;background:#2563EB;color:#fff;text-decoration:none;font-size:14px}` +
+		`table{width:100%;border-collapse:collapse;background:#fff;border-radius:12px;overflow:hidden;font-size:14px}` +
+		`th,td{text-align:left;padding:10px 12px;border-bottom:1px solid rgba(60,60,67,.08)}` +
+		`th{font-weight:600;color:#5A6478;font-size:12px}` +
+		`tr:last-child td{border-bottom:none}` +
+		`a{color:#2563EB;text-decoration:none;word-break:break-all}` +
+		`.sz{white-space:nowrap;text-align:right;color:#5A6478}` +
+		`.mt{white-space:nowrap;color:#5A6478}` +
+		`@media (max-width:600px){.mt{display:none}}` +
+		`</style></head><body><div class="wrap">` +
+		`<div class="hd"><h1>📁 ` + htmlEsc(title) + `</h1><span class="meta">共 ` + strconv.Itoa(len(rows)) + ` 项` +
+		` · 已下载 ` + strconv.Itoa(rec.Downloads) + ` 次` +
+		(func() string {
+			if rec.MaxDownloads > 0 {
+				return " / 限 " + strconv.Itoa(rec.MaxDownloads) + " 次"
+			}
+			return ""
+		})() +
+		`</span></div>`)
+	if parent != "" {
+		b.WriteString(`<p><a href="` + htmlEsc(parent) + `">← 上一级</a></p>`)
+	}
+	b.WriteString(`<p><a class="btn" href="` + htmlEsc(zipURL) + `">打包下载此目录（zip）</a></p>`)
+	b.WriteString(`<table><thead><tr><th>名称</th><th class="sz">大小</th><th class="mt">修改时间</th></tr></thead><tbody>`)
+	for _, row := range rows {
+		href := url.PathEscape(row.name)
+		display := row.name
+		if row.isDir {
+			href += "/"
+			display += "/"
+		}
+		mt := ""
+		if !row.mod.IsZero() {
+			mt = row.mod.Local().Format("2006-01-02 15:04")
+		}
+		sz := "—"
+		if !row.isDir {
+			sz = fmtSizeGo(row.size)
+		}
+		b.WriteString(`<tr><td><a href="` + htmlEsc(base+href) + `">` + htmlEsc(display) + `</a></td>` +
+			`<td class="sz">` + htmlEsc(sz) + `</td><td class="mt">` + htmlEsc(mt) + `</td></tr>`)
+	}
+	b.WriteString(`</tbody></table>`)
+	b.WriteString(`<p class="meta" style="margin-top:14px">点击单个文件即可只下载它；需要整包用上面的打包下载。</p>`)
+	b.WriteString(`</div></body></html>`)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(b.String()))
+}
+
+// serveShareDir 文件夹分享的入口：列表浏览 / 单文件按需下载 / 静态网页发布 / ?dl=1 整包。
+//
+// 计次语义（重要）：
+//   - 默认（Site=false）：列表页与站点导航本身不计次，但每个下发出去的文件都计一次，
+//     否则 maxDownloads 会被「逐个翻看」架空；
+//   - Site=true：目录当作静态网站发布，页面与子资源一律不计次（内容本就是所有者
+//     主动对外公开的网页），限次只约束显式的 ?dl=1 下载。
+//
+// 过期时间、密码门禁、防盗链、IP 封禁对上面两种模式一律生效（都走的是同一个前置检查）
+func serveShareDir(w http.ResponseWriter, r *http.Request, rec *Share, token, slug, sub, ip, ua string,
+	logFail func(string), countOnce func() bool, noQuota func()) {
+	// 目录型 URL 必须以 / 结尾：页面里的相对路径（css/js/图片）才会解析到
+	// /s/<slug>/xxx 而不是 /xxx。放在这里做跳转是安全的 —— 口令门禁与存在性
+	// 判定都已在调用方通过，不会因此多泄露任何状态
+	if !strings.HasSuffix(r.URL.Path, "/") {
+		target := r.URL.Path + "/"
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, target, http.StatusFound)
+		return
+	}
+	// 当前要展示的目录（sub 为空即分享根）
+	cur := rec.AbsPath
+	if sub != "" {
+		p, err := shareSubResolve(rec.AbsPath, sub)
+		if err != nil {
+			logFail("非法子路径")
+			writeJSON(w, 400, map[string]any{"error": "非法路径"})
+			return
+		}
+		stt, err := os.Stat(p)
+		if err != nil {
+			logFail("文件不存在")
+			writeJSON(w, 404, map[string]any{"error": "文件不存在"})
+			return
+		}
+		if !stt.IsDir() {
+			name := filepath.Base(p)
+			// 站点模式下的资源请求：内联下发、不计次
+			if rec.Site && r.URL.Query().Get("dl") != "1" {
+				serveShareStatic(w, r, p, name, true)
+				return
+			}
+			if r.Method != http.MethodHead && !countOnce() {
+				noQuota()
+				return
+			}
+			serveDownload(w, r, p, name)
+			return
+		}
+		cur = p
+	}
+	// ?dl=1：整包 zip（子目录就只打包该子目录），计一次
+	if r.URL.Query().Get("dl") == "1" {
+		if r.Method != http.MethodHead && !countOnce() {
+			noQuota()
+			return
+		}
+		root, _ := getRoot()
+		name := rec.Name
+		if cur != rec.AbsPath {
+			name = filepath.Base(cur)
+		}
+		serveShareZipPath(w, root, cur, name)
+		return
+	}
+	// 站点模式：目录里有 index.html 就直接渲染它（"丢个页面上去，复制链接就能访问"）
+	if rec.Site {
+		if idx, err := shareSubResolve(cur, "index.html"); err == nil {
+			if stIdx, e := os.Stat(idx); e == nil && !stIdx.IsDir() {
+				serveShareStatic(w, r, idx, "index.html", true)
+				return
+			}
+		}
+	}
+	// 列表页
+	items, err := os.ReadDir(cur)
+	if err != nil {
+		logFail("目录读取失败")
+		writeJSON(w, 500, map[string]any{"error": fsErr("读取分享目录", err)})
+		return
+	}
+	rows := make([]shareDirListing, 0, len(items))
+	for _, it := range items {
+		n := it.Name()
+		// 回收站与未完成的分片上传半成品不外泄
+		if n == trashDirName || isUploadTemp(n) {
+			continue
+		}
+		info, e := it.Info()
+		if e != nil {
+			continue
+		}
+		rows = append(rows, shareDirListing{name: n, isDir: it.IsDir(), size: info.Size(), mod: info.ModTime()})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].isDir != rows[j].isDir {
+			return rows[i].isDir
+		}
+		return strings.ToLower(rows[i].name) < strings.ToLower(rows[j].name)
+	})
+	q := url.Values{}
+	for k, v := range r.URL.Query() {
+		if k != "dl" {
+			q.Set(k, v[0])
+		}
+	}
+	zipURL := r.URL.Path + "?dl=1"
+	if len(q) > 0 {
+		zipURL += "&" + q.Encode()
+	}
+	renderShareDirPage(w, r, rec, slug, cur, rows, zipURL)
+}
+
+// serveShareZipPath 把一个目录流式打包成 zip 下发（边压缩边传，不落盘中转）。
+// root 传入根目录：打包时排除根级回收站（已删除文件不得借分享外泄）；
+// dir 可以是目录分享的任意层级，name 用于包名与 attachment 文件名
+func serveShareZipPath(w http.ResponseWriter, root, dir, name string) {
 	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", contentDisposition("attachment", rec.Name)+".zip")
+	w.Header().Set("Content-Disposition", contentDisposition("attachment", name)+".zip")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(200)
 	zw := zip.NewWriter(w)
 	defer zw.Close()
-	if err := zipAdd(zw, root, rec.AbsPath, rec.Name); err != nil {
+	if err := zipAdd(zw, root, dir, name); err != nil {
 		// 头已经发出，改不了状态码：把失败写进包里，否则 defer 的 Close()
 		// 会补出完整的中央目录，对方收到的只是一个「看起来正常」的残缺 zip
-		log.Printf("[分享打包] %s 中断: %v", rec.AbsPath, err)
+		log.Printf("[分享打包] %s 中断: %v", dir, err)
 		if f, e := zw.Create("_打包失败.txt"); e == nil {
 			fmt.Fprintf(f, "打包在完成前中断，压缩包内容不完整。\n原因：%v\n", err)
 		}

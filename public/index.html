@@ -459,6 +459,15 @@
         <p class="hint">直链：打开链接即开始下载；确认页：先展示文件信息，点击下载按钮才计数。</p>
       </div>
 
+      <div class="group hidden" id="share-site-group">
+        <div class="group-title">静态网页发布（仅文件夹）</div>
+        <label class="switch"><input type="checkbox" id="share-site"><span>作为静态网页发布</span></label>
+        <p class="hint">勾选后链接指向目录本身：里面若有 index.html 就直接当网站渲染，
+          页面引用的 css/js/图片按相对路径从同一链接取到，<b>浏览与资源加载不计次数</b>；
+          没有 index.html 则显示目录列表。不勾选时也可浏览列表，但每取用一个文件计一次下载。
+          注意：发布的页面与本站同源，只放自己写的 HTML。</p>
+      </div>
+
       <div class="group">
         <div class="group-title">链接别名与防盗链（可选）</div>
         <input type="text" id="share-alias" class="input-sm" placeholder="自定义链接尾段，如 发布会-materials（中英文/数字/-/_）" autocomplete="off">

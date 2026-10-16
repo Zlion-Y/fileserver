@@ -1598,6 +1598,11 @@ function openShare(rel, name, size) {
   shareTarget = { path: rel, name, size, created: null };
   $('#share-filename').textContent = name;
   $('#share-filesize').textContent = size == null ? '—' : fmtSize(size);
+  // 「作为静态网页发布」只对文件夹有意义：列表里目录传的 size 就是 null
+  const siteTg = $('#share-site');
+  if (siteTg) siteTg.checked = false;
+  const siteGrp = $('#share-site-group');
+  if (siteGrp) siteGrp.classList.toggle('hidden', size != null);
   $('#share-result').classList.add('hidden');
   $('#host-override').value = '';
   const aliasInp = $('#share-alias');
@@ -1658,6 +1663,7 @@ on('#btn-gen', 'click', async () => {
   const modeBtn = $('#seg-mode .seg-item.active');
   const pwInp = $('#share-password');
   const aliasInp = $('#share-alias'), hlTg = $('#share-hotlink');
+  const siteTg = $('#share-site');
   try {
     const r = await api(BASE + '/api/share', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1666,6 +1672,8 @@ on('#btn-gen', 'click', async () => {
         scheme: segState.scheme, host: $('#host-override').value.trim(),
         password: pwInp && !pwInp.disabled ? pwInp.value.trim() : '',
         mode: (modeBtn && modeBtn.dataset.mode) || 'direct',
+        // 只有分享目标是文件夹时才带上 site（后端也会拒绝文件分享开站点）
+        site: shareTarget.size == null && siteTg ? siteTg.checked : false,
         alias: aliasInp ? aliasInp.value.trim() : '',
         hotlink: hlTg ? hlTg.checked : false
       })
@@ -1969,6 +1977,9 @@ function toggleShareEdit(s, itemEl) {
     <div class="edit-row"><span class="edit-label">防盗链</span>
       <label class="switch"><input type="checkbox" id="se-hl-${s.token}"${s.hotlink ? ' checked' : ''}><span>拒绝其他网站的页面引用</span></label>
     </div>
+    ${s.isDir ? `<div class="edit-row"><span class="edit-label">静态网页</span>
+      <label class="switch"><input type="checkbox" id="se-site-${s.token}"${s.site ? ' checked' : ''}><span>作为静态网页发布（浏览不计次）</span></label>
+    </div>` : ''}
     <div class="edit-row"><span class="edit-label">访问方式</span>
       <span class="seg" id="se-mode-${s.token}">
         <button type="button" class="seg-item${s.mode !== 'page' ? ' active' : ''}" data-mode="direct">直链下载</button>
@@ -2006,6 +2017,7 @@ function toggleShareEdit(s, itemEl) {
       }
     }
     try {
+      const siteBox = s.isDir ? pane.querySelector(`#se-site-${s.token}`) : null;
       await api(BASE + '/api/share/update', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2013,7 +2025,9 @@ function toggleShareEdit(s, itemEl) {
           password: pane.querySelector(`#se-pw-${s.token}`).value.trim(),
           mode: (modeBtn && modeBtn.dataset.mode) || 'direct',
           alias: aliasVal,
-          hotlink: pane.querySelector(`#se-hl-${s.token}`).checked
+          hotlink: pane.querySelector(`#se-hl-${s.token}`).checked,
+          // null 表示「不修改」：只有文件夹才发这个字段
+          site: siteBox ? siteBox.checked : null
         })
       });
       toast('分享已更新');
