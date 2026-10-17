@@ -436,10 +436,15 @@ func TestDirShareListingAndSingleFile(t *testing.T) {
 		t.Fatalf("只看列表不该计次，实际 %d", n)
 	}
 
-	// 单个文件按需下载：计一次
-	code2, body2 := callRawGet(t, srv, "/s/"+tok+"/a.txt")
-	if code2 != 200 || body2 != "AAA" {
-		t.Fatalf("单文件下载应拿到内容，实际 %d / %q", code2, body2)
+	// 单个文件按需下载：计一次。
+	// 用不跟随重定向的客户端断言它必须是 200 而不是「补尾斜杠的 302」——
+	// 文件子路径一旦被补上 /，Linux 的 stat("…/a.txt/") 会 ENOTDIR 直接 404，
+	// 而 Windows 侥幸能用，这种平台差异只能靠这条断言钉住
+	res2 := callRaw(t, srv, "GET", "/s/"+tok+"/a.txt")
+	body2, _ := io.ReadAll(res2.Body)
+	res2.Body.Close()
+	if res2.StatusCode != 200 || string(body2) != "AAA" {
+		t.Fatalf("单文件下载应直接 200（不得被补尾斜杠跳转），实际 %d / %q", res2.StatusCode, body2)
 	}
 	// 子目录可继续浏览
 	code3, body3 := callRawGet(t, srv, "/s/"+tok+"/sub/")
@@ -518,6 +523,60 @@ func TestDirShareSiteMode(t *testing.T) {
 	}
 	if c5, _ := callRawGet(t, srv, "/s/"+tok+"/style.css?dl=1"); c5 != http.StatusForbidden {
 		t.Fatalf("限 1 次用完后显式下载应 403，实际 %d", c5)
+	}
+}
+
+func TestDirSharePreview(t *testing.T) {
+	srv, root := newServer(t)
+	writeFile(t, filepath.Join(root, "media", "photo.png"), strings.Repeat("p", 2048))
+	writeFile(t, filepath.Join(root, "media", "note.txt"), "hello-text")
+	writeFile(t, filepath.Join(root, "media", "blob.bin"), "binary-ish")
+	writeFile(t, filepath.Join(root, "media", "page.html"), "<script>alert(1)</script>")
+	sh := createShare(t, srv, `{"path":"media","expireSeconds":0,"maxDownloads":1,"scheme":"auto","host":"","mode":"direct","alias":"","hotlink":false,"password":""}`)
+	tok := sh.Share.Token
+
+	// 列表里可预览的项要给出「预览」入口
+	_, listing := callRawGet(t, srv, "/s/"+tok+"/")
+	if !strings.Contains(listing, "inline=1") || !strings.Contains(listing, "预览") {
+		t.Fatal("目录列表没有预览入口")
+	}
+	// 预览不计次
+	if c, _ := callRawGet(t, srv, "/s/"+tok+"/photo.png?inline=1"); c != 200 {
+		t.Fatalf("图片预览应 200，实际 %d", c)
+	}
+	if n := downloadsOf(t, srv, tok); n != 0 {
+		t.Fatalf("预览不该计次，实际 %d", n)
+	}
+	// 每个文件各自有额度：看完一张图不该把同目录的文本也锁掉
+	if c, _ := callRawGet(t, srv, "/s/"+tok+"/note.txt?inline=1"); c != 200 {
+		t.Fatalf("另一个文件的预览应独立放行，实际 %d", c)
+	}
+	// 浏览器渲染不了的类型直接拒，别把二进制内联进页面
+	if c, _ := callRawGet(t, srv, "/s/"+tok+"/blob.bin?inline=1"); c != http.StatusUnsupportedMediaType {
+		t.Fatalf("不可预览类型应回 415，实际 %d", c)
+	}
+	// HTML 在非站点目录里不得内联渲染：那会在本站源上执行脚本，
+	// 带着访问者的管理会话去调 /api
+	if c, _ := callRawGet(t, srv, "/s/"+tok+"/page.html?inline=1"); c != http.StatusUnsupportedMediaType {
+		t.Fatalf("非站点目录里的 HTML 不该被内联预览，实际 %d", c)
+	}
+	// 预览额度有限：把某个文件的额度打满后，反复取回整份内容要被封
+	previewMu.Lock()
+	previewBytes[previewKey(tok, "127.0.0.1", "photo.png")] = 2048 + previewSlack + 1
+	previewMu.Unlock()
+	if c, _ := callRawGet(t, srv, "/s/"+tok+"/photo.png?inline=1"); c != http.StatusTooManyRequests {
+		t.Fatalf("预览额度用尽后应 429，实际 %d", c)
+	}
+	// 下载仍然计次并受 maxDownloads 约束
+	if c, _ := callRawGet(t, srv, "/s/"+tok+"/photo.png"); c != 200 {
+		t.Fatalf("首次下载应 200，实际 %d", c)
+	}
+	if c, _ := callRawGet(t, srv, "/s/"+tok+"/photo.png"); c != http.StatusForbidden {
+		t.Fatalf("限 1 次用完后下载应 403，实际 %d", c)
+	}
+	// 配额耗尽后目录依然可浏览（浏览不计次是设计）
+	if c, _ := callRawGet(t, srv, "/s/"+tok+"/"); c != 200 {
+		t.Fatalf("配额耗尽后列表仍应可看，实际 %d", c)
 	}
 }
 

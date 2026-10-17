@@ -1475,12 +1475,29 @@ func serveShareStatic(w http.ResponseWriter, r *http.Request, path, name string,
 	serveInline(w, r, path, name)
 }
 
+// inlinePreviewable 该文件能否在浏览器里安全内联预览。
+// 只列「浏览器原生能渲染、且不会在本源上执行脚本」的类型：图片/音视频/PDF/纯文本类。
+// HTML 与 SVG 刻意排除 —— 内联渲染会执行其中的脚本，而目录分享通常匿名可访问，
+// 同源脚本可以带着访问者的管理会话去调 /api；只有所有者显式勾选「作为静态网页发布」
+// 的目录才允许渲染 HTML（走 serveShareStatic 的 render 分支）
+func inlinePreviewable(name string) bool {
+	if mediaKindOf(name) != "" {
+		return true
+	}
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".pdf", ".txt", ".log", ".md", ".json", ".csv", ".xml", ".ini", ".yml", ".yaml", ".conf", ".srt", ".vtt":
+		return true
+	}
+	return false
+}
+
 // shareDirListing 列表页的一行
 type shareDirListing struct {
-	name  string
-	isDir bool
-	size  int64
-	mod   time.Time
+	name    string
+	isDir   bool
+	size    int64
+	mod     time.Time
+	canPrev bool // 是否可在浏览器里直接预览（图片/音视频/PDF/文本）
 }
 
 // renderShareDirPage 目录列表页（借鉴 dufs 的 --render-try-index 之外的浏览体验：
@@ -1528,6 +1545,8 @@ func renderShareDirPage(w http.ResponseWriter, r *http.Request, rec *Share, slug
 		`th{font-weight:600;color:#5A6478;font-size:12px}` +
 		`tr:last-child td{border-bottom:none}` +
 		`a{color:#2563EB;text-decoration:none;word-break:break-all}` +
+		`a.pv{font-size:12px;color:#5A6478;border:1px solid rgba(60,60,67,.18);border-radius:6px;padding:2px 6px;margin-left:6px;white-space:nowrap}` +
+		`a.pv:hover{color:#2563EB;border-color:#2563EB}` +
 		`.sz{white-space:nowrap;text-align:right;color:#5A6478}` +
 		`.mt{white-space:nowrap;color:#5A6478}` +
 		`@media (max-width:600px){.mt{display:none}}` +
@@ -1561,11 +1580,15 @@ func renderShareDirPage(w http.ResponseWriter, r *http.Request, rec *Share, slug
 		if !row.isDir {
 			sz = fmtSizeGo(row.size)
 		}
-		b.WriteString(`<tr><td><a href="` + htmlEsc(base+href) + `">` + htmlEsc(display) + `</a></td>` +
-			`<td class="sz">` + htmlEsc(sz) + `</td><td class="mt">` + htmlEsc(mt) + `</td></tr>`)
+		b.WriteString(`<tr><td><a href="` + htmlEsc(base+href) + `">` + htmlEsc(display) + `</a>`)
+		if row.canPrev {
+			// 预览不消耗下载次数；下载链接（上面的文件名）仍然计一次
+			b.WriteString(` <a class="pv" href="` + htmlEsc(base+href+"?inline=1") + `">预览</a>`)
+		}
+		b.WriteString(`</td><td class="sz">` + htmlEsc(sz) + `</td><td class="mt">` + htmlEsc(mt) + `</td></tr>`)
 	}
 	b.WriteString(`</tbody></table>`)
-	b.WriteString(`<p class="meta" style="margin-top:14px">点击单个文件即可只下载它；需要整包用上面的打包下载。</p>`)
+	b.WriteString(`<p class="meta" style="margin-top:14px">点文件名只取用这一项（计一次下载）；「预览」在浏览器里直接看、不计次数；整包用上面的打包下载。</p>`)
 	b.WriteString(`</div></body></html>`)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -1584,39 +1607,84 @@ func renderShareDirPage(w http.ResponseWriter, r *http.Request, rec *Share, slug
 // 过期时间、密码门禁、防盗链、IP 封禁对上面两种模式一律生效（都走的是同一个前置检查）
 func serveShareDir(w http.ResponseWriter, r *http.Request, rec *Share, token, slug, sub, ip, ua string,
 	logFail func(string), countOnce func() bool, noQuota func()) {
-	// 目录型 URL 必须以 / 结尾：页面里的相对路径（css/js/图片）才会解析到
-	// /s/<slug>/xxx 而不是 /xxx。放在这里做跳转是安全的 —— 口令门禁与存在性
-	// 判定都已在调用方通过，不会因此多泄露任何状态
-	if !strings.HasSuffix(r.URL.Path, "/") {
+	// 只有「目录」型 URL 才必须以 / 结尾（页面里的相对路径才会解析到
+	// /s/<slug>/xxx 而不是 /xxx）；文件绝不能被补上尾斜杠 ——
+	// stat("…/a.txt/") 在 Linux 上是 ENOTDIR，早期写法对所有子路径一律
+	// 先 302 补斜杠，结果 Windows 靠 stat 容忍尾斜杠侥幸能下，Linux 直接 404
+	needSlashRedirect := func() {
 		target := r.URL.Path + "/"
 		if r.URL.RawQuery != "" {
 			target += "?" + r.URL.RawQuery
 		}
 		http.Redirect(w, r, target, http.StatusFound)
-		return
 	}
 	// 当前要展示的目录（sub 为空即分享根）
 	cur := rec.AbsPath
 	if sub != "" {
 		p, err := shareSubResolve(rec.AbsPath, sub)
-		if err != nil {
-			logFail("非法子路径")
-			writeJSON(w, 400, map[string]any{"error": "非法路径"})
-			return
+		var stt os.FileInfo
+		if err == nil {
+			stt, err = os.Stat(p)
 		}
-		stt, err := os.Stat(p)
+		if err != nil && strings.HasSuffix(sub, "/") {
+			// 客户端多写了尾斜杠而目标其实是文件：剥掉再判一次
+			if trimmed := strings.TrimRight(sub, "/"); trimmed != "" && trimmed != sub {
+				if p2, e2 := shareSubResolve(rec.AbsPath, trimmed); e2 == nil {
+					if st2, e3 := os.Stat(p2); e3 == nil {
+						p, stt, sub = p2, st2, trimmed
+						err = nil
+					}
+				}
+			}
+		}
 		if err != nil {
+			if !os.IsNotExist(err) {
+				logFail("非法子路径")
+				writeJSON(w, 400, map[string]any{"error": "非法路径"})
+				return
+			}
 			logFail("文件不存在")
 			writeJSON(w, 404, map[string]any{"error": "文件不存在"})
 			return
 		}
 		if !stt.IsDir() {
 			name := filepath.Base(p)
-			// 站点模式下的资源请求：内联下发、不计次
-			if rec.Site && r.URL.Query().Get("dl") != "1" {
+			dl := r.URL.Query().Get("dl") == "1"
+			// 站点模式：目录内容就是发布出去给人看的，一律内联、不计次
+			if rec.Site && !dl {
 				serveShareStatic(w, r, p, name, true)
 				return
 			}
+			// 预览：不消耗下载次数，但要按「一个文件长度 + slack」记额度
+			// （与单文件分享的 ?inline=1 同一套账），否则限次链接可以靠反复
+			// 预览把整个文件白嫖走
+			if r.URL.Query().Get("inline") == "1" {
+				if !inlinePreviewable(name) {
+					writeJSON(w, http.StatusUnsupportedMediaType, map[string]any{"error": "该类型不支持在线预览，请直接下载"})
+					return
+				}
+				key := previewKey(token, ip, sub)
+				if !previewAllowKey(key, stt.Size()) {
+					writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "预览额度已用完，请通过下载按钮获取文件"})
+					return
+				}
+				pw := &countingWriter{ResponseWriter: w}
+				serveShareStatic(pw, r, p, name, false)
+				previewChargeKey(key, pw.n)
+				// 只给首次完整拉取记一条「预览」日志，拖动进度条的片段不记，
+				// 免得一次播放把访问日志刷满
+				if r.Header.Get("Range") == "" {
+					shareMu.Lock()
+					if l := shares[token]; l != nil {
+						appendShareLog(l, ip, ua, true, "预览")
+					}
+					shareMu.Unlock()
+					markSharesDirty()
+				}
+				return
+			}
+			// 其余（裸路径与 ?dl=1）：附件下载，计一次 —— 保持「按需下载」的
+			// 计次语义，逐个翻看不会把 maxDownloads 架空
 			if r.Method != http.MethodHead && !countOnce() {
 				noQuota()
 				return
@@ -1624,7 +1692,16 @@ func serveShareDir(w http.ResponseWriter, r *http.Request, rec *Share, token, sl
 			serveDownload(w, r, p, name)
 			return
 		}
+		// 到这儿 sub 指向的是目录：补上尾斜杠，页面里的相对链接才会落在
+		// /s/<slug>/<子目录>/ 下
+		if !strings.HasSuffix(r.URL.Path, "/") {
+			needSlashRedirect()
+			return
+		}
 		cur = p
+	} else if !strings.HasSuffix(r.URL.Path, "/") {
+		needSlashRedirect()
+		return
 	}
 	// ?dl=1：整包 zip（子目录就只打包该子目录），计一次
 	if r.URL.Query().Get("dl") == "1" {
@@ -1667,7 +1744,10 @@ func serveShareDir(w http.ResponseWriter, r *http.Request, rec *Share, token, sl
 		if e != nil {
 			continue
 		}
-		rows = append(rows, shareDirListing{name: n, isDir: it.IsDir(), size: info.Size(), mod: info.ModTime()})
+		rows = append(rows, shareDirListing{
+			name: n, isDir: it.IsDir(), size: info.Size(), mod: info.ModTime(),
+			canPrev: !it.IsDir() && inlinePreviewable(n),
+		})
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].isDir != rows[j].isDir {
@@ -1813,14 +1893,17 @@ func sharePwGate(w http.ResponseWriter, rec *Share, token, ip string, isDirShare
 // 重叠区间，卡得太死会让正常预览放不完，太松又等于白送
 const previewSlack = 8 << 20
 
-// previewAllow 判断该 token|ip 还能不能再取 inline 预览内容，额度为一个文件长度。
-//
-// 旧的布尔版「每个 IP 只放行一次无 Range 的请求」拦不住任何东西：
-// 带任意 Range 头就完全跳过这道闸（bytes=1- 即可反复取回几乎整个文件），
-// 把文件按 1KB 切片依次请求也永远不会触发它。两种用法都能让
-// maxDownloads=1 的媒体链接被无限次完整回捞，等于 maxDownloads 形同虚设
-func previewAllow(token, ip string, size int64) bool {
-	key := token + "|" + ip
+// previewKey 预览额度的记账键。目录分享要按「具体文件」分开记：
+// 只用 token|ip 一个键的话，看过一张图之后同目录里其它图片就全被拦了
+func previewKey(token, ip, sub string) string {
+	if sub == "" {
+		return token + "|" + ip
+	}
+	return token + "|" + ip + "|" + sub
+}
+
+// previewAllowKey 判断该键还能不能再取 inline 内容，额度为一个文件长度 + slack
+func previewAllowKey(key string, size int64) bool {
 	previewMu.Lock()
 	defer previewMu.Unlock()
 	if len(previewBytes) > previewMaxIP && previewBytes[key] == 0 {
@@ -1831,14 +1914,24 @@ func previewAllow(token, ip string, size int64) bool {
 	return previewBytes[key] < size+previewSlack
 }
 
-// previewCharge 累加本次 inline 响应实际外发的字节数
-func previewCharge(token, ip string, n int64) {
+// previewChargeKey 累加本次 inline 响应实际外发的字节数
+func previewChargeKey(key string, n int64) {
 	if n <= 0 {
 		return
 	}
 	previewMu.Lock()
-	previewBytes[token+"|"+ip] += n
+	previewBytes[key] += n
 	previewMu.Unlock()
+}
+
+// previewAllow 单文件分享用的便捷封装（sub 为空）
+func previewAllow(token, ip string, size int64) bool {
+	return previewAllowKey(previewKey(token, ip, ""), size)
+}
+
+// previewCharge 单文件分享用的便捷封装
+func previewCharge(token, ip string, n int64) {
+	previewChargeKey(previewKey(token, ip, ""), n)
 }
 
 // previewGC 回收已不存在分享的预览记录（每小时清理任务调用）
